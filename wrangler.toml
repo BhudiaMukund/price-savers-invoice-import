@@ -1,0 +1,31 @@
+name = "invoice-import"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Static frontend lives in ./public and is served by the Worker.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+not_found_handling = "single-page-application"
+[vars]
+SHOPIFY_STORE_DOMAIN = "ui-extension-dev-store-hncqqxwz.myshopify.com"
+SHOPIFY_API_VERSION = "2025-07"
+# Swap model/provider here (or via dashboard) without touching code.
+AI_PROVIDER = "gemini"
+AI_MODEL = "gemini-3.8-flash"   # 2.5 models shut down 16 Oct 2026
+AI_FALLBACK_MODEL = "gemini-3.1-flash-lite"
+# Cloudflare Access (sign-in). Fill in after creating the Access application.
+ACCESS_TEAM_DOMAIN = "bhudiahl.cloudflareaccess.com"   # e.g. yourteam.cloudflareaccess.com
+ACCESS_AUD = "ab6591fcdad4d12fdfc3934281413f8053c15cffbc16c6ca1738d70054e9adb0"           # Application Audience (AUD) tag
+
+# Secrets (set with `wrangler secret put <NAME>`):
+#   SHOPIFY_CLIENT_ID      - Dev Dashboard app client ID
+#   SHOPIFY_CLIENT_SECRET  - Dev Dashboard app client secret
+#   (or SHOPIFY_ADMIN_TOKEN instead of the two above, only for an older legacy custom app)
+#   GEMINI_API_KEY         - Google AI Studio key
+
+[[d1_databases]]
+binding = "DB"
+database_name = "invoice-import-db"
+database_id = "959d5c54-7bf7-4e91-8fcb-895b10a54b6d"

@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Invoice Import</title>
+  <meta name="robots" content="noindex" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#2B2F39" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23FFD100'/%3E%3Cpath fill='%232B2F39' d='M8 8h2v16H8zm4 0h1v16h-1zm3 0h3v16h-3zm5 0h1v16h-1zm3 0h1v16h-1z'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" />
+  <link rel="stylesheet" href="/styles.css" />
+  <script type="module" src="/js/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="appbar">
+    <nav class="appbar-brand" aria-label="Where you are">
+      <a class="brand-home" href="/" data-nav title="New import">
+        <span class="mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="28" height="28"><rect width="32" height="32" rx="8" /><path d="M8 8h2v16H8zm4 0h1v16h-1zm3 0h3v16h-3zm5 0h1v16h-1zm3 0h1v16h-1z" /></svg>
+        </span>
+        <span class="appbar-shop">Price Savers</span>
+      </a>
+      <span class="appbar-sep" aria-hidden="true">/</span>
+      <a class="appbar-tool" href="/" data-nav>Invoice import</a>
+      <span class="appbar-sep crumb-run-sep" aria-hidden="true" hidden>/</span>
+      <span class="crumb-run" id="crumb-run" hidden></span>
+    </nav>
+    <div class="appbar-right">
+      <a class="nav-link" href="/runs" data-nav id="nav-runs"><span data-icon="history"></span><span class="nav-link-text">Runs</span></a>
+      <span class="conn" id="conn" data-state="pending"><span class="conn-dot"></span><span class="conn-text">Connecting…</span></span>
+      <div class="account">
+        <button type="button" class="avatar" id="avatar" aria-haspopup="true" aria-expanded="false" aria-label="Account">·</button>
+        <div class="menu" id="account-menu" role="menu" hidden>
+          <p class="menu-email" id="menu-email"></p>
+          <a class="menu-item" role="menuitem" href="/cdn-cgi/access/logout" id="signout">Sign out</a>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <!-- Empty state: shown until there's something to review -->
+    <section class="start" id="start" aria-labelledby="start-title">
+      <div class="start-inner">
+        <svg class="start-art" viewBox="0 0 220 150" aria-hidden="true">
+          <rect class="art-sheet-back" x="58" y="16" width="104" height="126" rx="8" />
+          <rect class="art-sheet" x="44" y="8" width="104" height="126" rx="8" />
+          <rect class="art-line strong" x="58" y="24" width="44" height="6" rx="3" />
+          <rect class="art-line" x="58" y="40" width="76" height="4" rx="2" />
+          <rect class="art-line" x="58" y="52" width="64" height="4" rx="2" />
+          <rect class="art-line" x="58" y="64" width="70" height="4" rx="2" />
+          <rect class="art-line" x="58" y="76" width="52" height="4" rx="2" />
+          <g class="art-bars">
+            <rect x="58" y="96" width="3" height="24" /><rect x="63" y="96" width="1.5" height="24" /><rect x="66.5" y="96" width="4" height="24" />
+            <rect x="73" y="96" width="1.5" height="24" /><rect x="77" y="96" width="3" height="24" /><rect x="82" y="96" width="1.5" height="24" />
+            <rect x="85.5" y="96" width="1.5" height="24" /><rect x="89" y="96" width="4" height="24" /><rect x="95" y="96" width="1.5" height="24" />
+            <rect x="98.5" y="96" width="3" height="24" /><rect x="103.5" y="96" width="1.5" height="24" /><rect x="107" y="96" width="1.5" height="24" />
+          </g>
+          <g class="art-tag" transform="rotate(-12 160 92)">
+            <path d="M138 70h36a6 6 0 0 1 6 6v32a6 6 0 0 1-6 6h-36l-14-22z" />
+            <circle cx="138" cy="92" r="4" class="art-tag-hole" />
+            <rect x="148" y="84" width="22" height="5" rx="2.5" class="art-tag-line" />
+            <rect x="148" y="95" width="14" height="5" rx="2.5" class="art-tag-line" />
+          </g>
+        </svg>
+
+        <h1 id="start-title">Import a supplier invoice</h1>
+        <p class="start-lede">Drop in the invoice and we'll list every product on it, check each barcode against your Shopify store, and add only the new ones.</p>
+
+        <div class="dropcard" id="dropcard">
+          <div class="dropcard-actions">
+            <label class="btn btn-brand btn-lg">
+              <span class="btn-icon" data-icon="upload"></span>
+              Choose files
+              <input id="pick" type="file" multiple class="visually-hidden" />
+            </label>
+            <label class="btn btn-lg btn-secondary">
+              <span class="btn-icon" data-icon="camera"></span>
+              Take a photo
+              <input id="camera" type="file" accept="image/*" capture="environment" class="visually-hidden" />
+            </label>
+          </div>
+          <p class="dropcard-hint">or drag them here. PDF, photo, Excel or CSV.</p>
+        </div>
+
+        <ol class="steps" aria-label="How it works">
+          <li><span class="step-n">1</span><span><strong>Upload</strong> one or more invoices</span></li>
+          <li><span class="step-n">2</span><span><strong>Check</strong> the list and fix anything flagged</span></li>
+          <li><span class="step-n">3</span><span><strong>Add</strong> the new products to Shopify</span></li>
+        </ol>
+
+        <p class="start-foot">
+          Each import starts a new run, saved under your name, that anyone can open again later.
+          <button type="button" class="link" id="manual-start">Add products by hand</button>
+        </p>
+
+        <section class="recent" id="recent" aria-labelledby="recent-title" hidden>
+          <div class="recent-head">
+            <h2 id="recent-title">Recent runs</h2>
+            <a class="link" href="/runs" data-nav>See all runs</a>
+          </div>
+          <ul class="run-list run-list-compact" id="recent-list"></ul>
+        </section>
+      </div>
+    </section>
+
+    <!-- Runs: every past session, searchable -->
+    <section class="runs-page" id="runs-page" hidden aria-labelledby="runs-title">
+      <div class="runs-inner">
+        <div class="runs-head">
+          <div>
+            <h1 id="runs-title">Runs</h1>
+            <p class="runs-sub">Every import session, newest first. Search by invoice, supplier, import ID, product, barcode or person.</p>
+          </div>
+          <a class="btn btn-brand" href="/" data-nav><span class="btn-icon" data-icon="plus"></span>New import</a>
+        </div>
+        <div class="runs-tools">
+          <div class="search runs-search">
+            <span class="search-icon" data-icon="search"></span>
+            <input id="runs-q" type="search" placeholder="Search runs" aria-label="Search runs" autocomplete="off" />
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="runs-mine" class="check" />
+            <span>Only mine</span>
+          </label>
+        </div>
+        <ul class="run-list" id="runs-list" aria-live="polite"></ul>
+        <div class="list-empty" id="runs-empty" hidden></div>
+        <div class="runs-more"><button type="button" class="btn btn-secondary" id="runs-more" hidden>Show older runs</button></div>
+      </div>
+    </section>
+
+    <section class="loading-page" id="loading-page" hidden>
+      <p><span class="spinner" aria-hidden="true"></span><span id="loading-text">Opening the run…</span></p>
+    </section>
+
+    <!-- Workspace: invoices rail + review list -->
+    <section class="workspace" id="workspace" hidden aria-label="Review">
+      <aside class="rail" aria-labelledby="rail-title">
+        <div class="rail-head">
+          <h2 id="rail-title">Invoices</h2>
+          <div class="rail-head-actions">
+            <label class="btn btn-sm btn-secondary" title="Add more invoices">
+              <span class="btn-icon" data-icon="plus"></span>
+              Add
+              <input id="pick-more" type="file" multiple class="visually-hidden" />
+            </label>
+          </div>
+        </div>
+        <ul class="sources" id="sources"></ul>
+        <p class="rail-hint">Drop more files anywhere on the page.</p>
+      </aside>
+
+      <div class="review">
+        <div class="run-bar" id="run-bar">
+          <p class="run-line" id="run-line"></p>
+          <span class="save-state" id="save-state" data-state="saved"></span>
+          <button type="button" class="link run-delete" id="run-delete" hidden>Delete run</button>
+        </div>
+        <div class="review-head">
+          <div>
+            <h2 class="review-title">Review products</h2>
+            <p class="review-sub" id="review-sub"></p>
+          </div>
+          <div class="review-tools">
+            <div class="search">
+              <span class="search-icon" data-icon="search"></span>
+              <input id="search" type="search" placeholder="Search title, code or barcode" aria-label="Search products" autocomplete="off" />
+            </div>
+            <button type="button" class="btn btn-secondary btn-icon-only" id="recheck" title="Check again against the store" aria-label="Check again against the store"><span class="btn-icon" data-icon="refresh"></span></button>
+            <button type="button" class="btn btn-secondary btn-icon-only" id="add-manual" title="Add a product by hand" aria-label="Add a product by hand"><span class="btn-icon" data-icon="plus"></span></button>
+          </div>
+        </div>
+
+        <div class="filters" role="tablist" aria-label="Show products" id="filters"></div>
+
+        <div class="callout" id="callout" hidden>
+          <span class="callout-icon" data-icon="alert"></span>
+          <p id="callout-text"></p>
+          <button type="button" class="btn btn-sm btn-warn" id="fix-start">Fix now</button>
+        </div>
+
+        <div class="list" id="list" role="grid" aria-labelledby="review-title" aria-multiselectable="true">
+          <div class="list-head" role="row">
+            <span role="columnheader" class="lh-sel"><input type="checkbox" id="select-all" class="check" aria-label="Select all shown" /></span>
+            <span role="columnheader">Product</span>
+            <span role="columnheader" class="lh-bar">Barcode</span>
+            <span role="columnheader" class="lh-status">Status</span>
+            <span role="columnheader" class="lh-go"><span class="visually-hidden">Open</span></span>
+          </div>
+          <div class="list-body" id="list-body" role="rowgroup"></div>
+        </div>
+        <div class="list-empty" id="list-empty" hidden></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Floating action bar -->
+  <div class="actionbar" id="actionbar" hidden role="region" aria-label="Selected products">
+    <div class="actionbar-inner">
+      <p class="actionbar-count" id="ab-count"></p>
+      <button type="button" class="ab-clear" id="ab-clear">Clear</button>
+      <div class="ab-progress" id="ab-progress" hidden><div id="ab-progress-fill"></div></div>
+      <button type="button" class="btn btn-brand" id="ab-add"></button>
+    </div>
+  </div>
+
+  <!-- Edit panel -->
+  <div class="scrim" id="scrim" hidden></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="dr-title" hidden>
+    <header class="drawer-head">
+      <div class="drawer-nav">
+        <button type="button" class="btn btn-ghost btn-icon-only" id="dr-prev" aria-label="Previous product"><span class="btn-icon" data-icon="up"></span></button>
+        <button type="button" class="btn btn-ghost btn-icon-only" id="dr-next" aria-label="Next product"><span class="btn-icon" data-icon="down"></span></button>
+        <span class="drawer-pos" id="dr-pos"></span>
+      </div>
+      <button type="button" class="btn btn-ghost btn-icon-only" id="dr-close" aria-label="Close"><span class="btn-icon" data-icon="x"></span></button>
+    </header>
+    <div class="drawer-body" id="drawer-body">
+      <div class="dr-status" id="dr-status"></div>
+      <h2 class="visually-hidden" id="dr-title">Edit product</h2>
+
+      <div class="field">
+        <label for="dr-name">Product title</label>
+        <textarea id="dr-name" rows="2" maxlength="255" placeholder="What the product is called on the shelf"></textarea>
+        <div class="alts" id="dr-alts"></div>
+      </div>
+
+      <div class="field">
+        <label for="dr-barcode">Barcode</label>
+        <div class="barcode-input">
+          <span class="bi-icon" data-icon="scan"></span>
+          <input id="dr-barcode" class="mono" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="64" placeholder="Scan or type the barcode" />
+        </div>
+        <div class="barcode-big" id="dr-bars" aria-live="polite"></div>
+      </div>
+
+      <div class="field">
+        <label for="dr-code">Supplier code <span class="opt">Optional, saved as the SKU</span></label>
+        <input id="dr-code" class="mono" autocomplete="off" spellcheck="false" maxlength="64" placeholder="None" />
+      </div>
+
+      <div class="store-check" id="dr-store" aria-live="polite"></div>
+
+      <label class="include">
+        <input type="checkbox" id="dr-include" class="check" />
+        <span>Include when adding to Shopify</span>
+      </label>
+
+      <p class="dr-source" id="dr-source"></p>
+    </div>
+    <footer class="drawer-foot">
+      <button type="button" class="btn btn-ghost btn-danger" id="dr-remove"><span class="btn-icon" data-icon="trash"></span>Remove</button>
+      <div class="drawer-foot-right">
+        <button type="button" class="btn btn-secondary" id="dr-skip" hidden>Skip</button>
+        <button type="button" class="btn btn-primary" id="dr-done">Done</button>
+      </div>
+    </footer>
+  </aside>
+
+  <!-- Confirm -->
+  <dialog class="modal" id="confirm" aria-labelledby="cf-title">
+    <form method="dialog">
+      <h2 id="cf-title"></h2>
+      <ul class="facts" id="cf-facts"></ul>
+      <div class="modal-actions">
+        <button value="cancel" class="btn btn-secondary">Cancel</button>
+        <button value="ok" class="btn btn-brand" id="cf-ok"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Done -->
+  <dialog class="modal modal-done" id="done" aria-labelledby="dn-title">
+    <form method="dialog">
+      <div class="done-mark" id="dn-mark"></div>
+      <h2 id="dn-title"></h2>
+      <p class="done-sub" id="dn-sub"></p>
+      <div class="done-ids" id="dn-ids"></div>
+      <div class="modal-actions modal-actions-stack">
+        <button value="new" class="btn btn-brand" id="dn-new">Import another invoice</button>
+        <button value="review" class="btn btn-secondary" id="dn-review"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Drop overlay -->
+  <div class="dropzone" id="dropzone" hidden aria-hidden="true">
+    <div class="dropzone-card">
+      <span data-icon="upload" class="dz-icon"></span>
+      <p>Drop to import</p>
+    </div>
+  </div>
+
+  <datalist id="supplier-list"></datalist>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>
