@@ -52,15 +52,91 @@ const SCHEMA = [
    )`,
   `CREATE INDEX IF NOT EXISTS imported_by_run ON imported_products(run_id)`,
   `CREATE INDEX IF NOT EXISTS imported_by_import ON imported_products(import_id)`,
+  // Supplier catalogues: reference data only (nothing is created in Shopify except the photos, in Files).
+  `CREATE TABLE IF NOT EXISTS catalogue_uploads (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     code TEXT UNIQUE,
+     supplier TEXT NOT NULL,
+     supplier_key TEXT NOT NULL,
+     file_names TEXT NOT NULL DEFAULT '',
+     created_by TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     finished_at TEXT,
+     item_count INTEGER NOT NULL DEFAULT 0,
+     photo_count INTEGER NOT NULL DEFAULT 0,
+     undone_at TEXT,
+     undone_by TEXT
+   )`,
+  `CREATE TABLE IF NOT EXISTS catalogue_items (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     upload_id INTEGER NOT NULL,
+     supplier_key TEXT NOT NULL,
+     barcode TEXT,
+     barcode_key TEXT,
+     code TEXT,
+     code_key TEXT,
+     title TEXT,
+     description TEXT,
+     mixed INTEGER NOT NULL DEFAULT 0
+   )`,
+  `CREATE INDEX IF NOT EXISTS cat_items_barcode ON catalogue_items(barcode_key)`,
+  `CREATE INDEX IF NOT EXISTS cat_items_code ON catalogue_items(supplier_key, code_key)`,
+  `CREATE INDEX IF NOT EXISTS cat_items_upload ON catalogue_items(upload_id)`,
+  `CREATE TABLE IF NOT EXISTS catalogue_photos (
+     item_id INTEGER NOT NULL,
+     file_id TEXT NOT NULL,
+     position INTEGER NOT NULL,
+     PRIMARY KEY (item_id, file_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS cat_photos_file ON catalogue_photos(file_id)`,
+  `CREATE TABLE IF NOT EXISTS catalogue_files (
+     file_id TEXT PRIMARY KEY,
+     fingerprint TEXT UNIQUE,
+     upload_id INTEGER NOT NULL,
+     status TEXT NOT NULL DEFAULT 'processing',
+     url TEXT,
+     error TEXT,
+     source TEXT,
+     created_at TEXT NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS cat_files_upload ON catalogue_files(upload_id, status)`,
+  // Shared settings (the Settings page), one row per setting.
+  `CREATE TABLE IF NOT EXISTS settings (
+     key TEXT PRIMARY KEY,
+     value TEXT NOT NULL,
+     updated_by TEXT,
+     updated_at TEXT NOT NULL
+   )`,
 ];
 
 let ready: Promise<void> | null = null;
 let readyFor: Db | null = null;
 
-async function ensureSchema(db: Db) {
+/** Columns added after the first release. SQLite has no "ADD COLUMN IF NOT EXISTS": each is tried on its own. */
+const ADDED_COLUMNS = [
+  `ALTER TABLE catalogue_files ADD COLUMN sig TEXT`,
+  `ALTER TABLE catalogue_files ADD COLUMN thumb TEXT`,
+  `ALTER TABLE catalogue_files ADD COLUMN pixels INTEGER`,
+  `ALTER TABLE catalogue_files ADD COLUMN merged_into TEXT`,
+];
+
+async function addColumns(db: Db) {
+  for (const sql of ADDED_COLUMNS) {
+    try {
+      await db.prepare(sql).run();
+    } catch {
+      /* already there */
+    }
+  }
+}
+
+export async function ensureSchema(db: Db) {
   if (ready && readyFor === db) return ready;
   readyFor = db;
-  ready = db.batch(SCHEMA.map((s) => db.prepare(s))).then(() => undefined);
+  ready = db
+    .batch(SCHEMA.map((s) => db.prepare(s)))
+    .then(() => addColumns(db))
+    .then(() => undefined);
   ready.catch(() => {
     ready = null; // try again on the next request
   });

@@ -22,8 +22,10 @@ export interface Env {
   DEV_AUTH_BYPASS?: string;
   /** Product metafield that records which import a product came from. Default "custom.import_source". */
   IMPORT_SOURCE_METAFIELD?: string;
-  /** "false" to stop adding an import-<ID> tag to products. */
+  /** "false" to stop adding an import-<ID> tag to products (the starting value of the setting). */
   IMPORT_TAGS?: string;
+  /** Comma-separated emails of the people allowed to change settings and delete suppliers. Empty: everyone. */
+  ADMIN_EMAILS?: string;
 }
 
 /** One line item as read from an invoice. Cost and quantity are deliberately not captured. */

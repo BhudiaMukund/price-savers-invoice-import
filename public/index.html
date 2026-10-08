@@ -32,11 +32,13 @@
     </nav>
     <div class="appbar-right">
       <a class="nav-link" href="/runs" data-nav id="nav-runs"><span data-icon="history"></span><span class="nav-link-text">Runs</span></a>
+      <a class="nav-link" href="/catalogues" data-nav id="nav-catalogues"><span data-icon="image"></span><span class="nav-link-text">Catalogues</span></a>
       <span class="conn" id="conn" data-state="pending"><span class="conn-dot"></span><span class="conn-text">Connecting…</span></span>
       <div class="account">
         <button type="button" class="avatar" id="avatar" aria-haspopup="true" aria-expanded="false" aria-label="Account">·</button>
         <div class="menu" id="account-menu" role="menu" hidden>
           <p class="menu-email" id="menu-email"></p>
+          <a class="menu-item" role="menuitem" href="/settings" data-nav id="menu-settings">Settings</a>
           <a class="menu-item" role="menuitem" href="/cdn-cgi/access/logout" id="signout">Sign out</a>
         </div>
       </div>
@@ -132,6 +134,125 @@
         <ul class="run-list" id="runs-list" aria-live="polite"></ul>
         <div class="list-empty" id="runs-empty" hidden></div>
         <div class="runs-more"><button type="button" class="btn btn-secondary" id="runs-more" hidden>Show older runs</button></div>
+      </div>
+    </section>
+
+    <!-- Supplier catalogues: list, upload, fill missing photos -->
+    <section class="runs-page cat-page" id="cat-page" hidden aria-labelledby="cat-title">
+      <div class="runs-inner">
+        <div class="runs-head">
+          <div>
+            <h1 id="cat-title">Supplier catalogues</h1>
+            <p class="runs-sub">Product lists and photos from your suppliers. Nothing here is added to your store: when you import an invoice, matching products get these photos and descriptions.</p>
+          </div>
+        </div>
+        <div class="cat-banner" id="cat-banner" hidden></div>
+
+        <div class="cat-cards">
+          <section class="cat-card cat-upload" id="cat-upload" aria-labelledby="cat-upload-title">
+            <div class="cat-card-icon" data-icon="upload"></div>
+            <div class="cat-card-body">
+              <h2 id="cat-upload-title">Add a catalogue</h2>
+              <p>An Excel or CSV export (with pictures inside or photo links), a ZIP, or photos named by code or barcode.</p>
+              <label class="btn btn-brand">
+                <span class="btn-icon" data-icon="upload"></span>
+                Choose files
+                <input id="cat-pick" type="file" multiple class="visually-hidden" accept=".xlsx,.xlsm,.xls,.csv,.tsv,.txt,.zip,.jpg,.jpeg,.png,.gif,.webp" />
+              </label>
+              <span class="cat-drop-hint">or drop them on this page</span>
+            </div>
+          </section>
+          <section class="cat-card" aria-labelledby="cat-missing-title">
+            <div class="cat-card-icon" data-icon="image"></div>
+            <div class="cat-card-body">
+              <h2 id="cat-missing-title">Fill in missing photos</h2>
+              <p>Find products already in your store with no photo that a catalogue has photos for.</p>
+              <button type="button" class="btn btn-secondary" id="cat-missing-find"><span class="btn-icon" data-icon="search"></span>Find products</button>
+            </div>
+          </section>
+        </div>
+
+        <!-- Upload wizard: shown after files are picked -->
+        <section class="cat-wizard" id="cat-wizard" hidden aria-live="polite"></section>
+
+        <!-- Missing photos results -->
+        <section class="cat-missing" id="cat-missing" hidden></section>
+
+        <div class="recent-head cat-list-head">
+          <h2>Uploads</h2>
+          <div class="search runs-search cat-list-search">
+            <span class="search-icon" data-icon="search"></span>
+            <input id="cat-q" type="search" placeholder="Search by supplier or file" aria-label="Search catalogue uploads" autocomplete="off" />
+          </div>
+        </div>
+        <ul class="run-list" id="cat-list" aria-live="polite"></ul>
+        <div class="list-empty" id="cat-empty" hidden></div>
+        <div class="runs-more"><button type="button" class="btn btn-secondary" id="cat-more" hidden>Show older uploads</button></div>
+      </div>
+    </section>
+
+    <!-- Settings (from the profile menu) -->
+    <section class="runs-page" id="settings-page" hidden aria-labelledby="set-title">
+      <div class="runs-inner set-inner">
+        <div class="runs-head">
+          <div>
+            <h1 id="set-title">Settings</h1>
+            <p class="runs-sub" id="set-who"></p>
+          </div>
+        </div>
+
+        <section class="set-card" aria-labelledby="set-new-title">
+          <h2 id="set-new-title">New products</h2>
+          <ul class="set-list" id="set-toggles"></ul>
+        </section>
+
+        <section class="set-card" aria-labelledby="set-sup-title">
+          <div class="set-card-head">
+            <div>
+              <h2 id="set-sup-title">Suppliers</h2>
+              <p class="set-card-sub" id="set-sup-sum">Loading…</p>
+            </div>
+            <button type="button" class="btn btn-secondary btn-icon-only" id="set-sup-refresh" title="Check the store again" aria-label="Check the store again"><span class="btn-icon" data-icon="refresh"></span></button>
+          </div>
+          <p class="set-note">A supplier can be deleted when no product in your store has it as its vendor and it has no catalogue. Suppliers on products come from Shopify: change those products' vendor in Shopify to retire one.</p>
+          <div class="runs-tools set-tools">
+            <div class="search runs-search">
+              <span class="search-icon" data-icon="search"></span>
+              <input id="set-sup-q" type="search" placeholder="Search suppliers" aria-label="Search suppliers" autocomplete="off" />
+            </div>
+            <label class="toggle"><input type="checkbox" id="set-sup-unused" class="check" /><span>Only not used</span></label>
+          </div>
+          <ul class="set-sups" id="set-suppliers"></ul>
+        </section>
+      </div>
+    </section>
+
+    <!-- One catalogue upload -->
+    <section class="runs-page" id="catalogue-page" hidden aria-labelledby="cu-title">
+      <div class="runs-inner">
+        <a class="link back-link" href="/catalogues" data-nav><span data-icon="left"></span>All catalogues</a>
+        <div class="runs-head">
+          <div>
+            <h1 id="cu-title"></h1>
+            <p class="runs-sub" id="cu-sub"></p>
+          </div>
+          <button type="button" class="btn btn-ghost btn-danger" id="cu-undo" hidden><span class="btn-icon" data-icon="trash"></span>Undo this upload</button>
+        </div>
+        <div class="cu-stats" id="cu-stats"></div>
+        <div class="cat-banner" id="cu-banner" hidden></div>
+        <details class="cu-failed" id="cu-failed" hidden>
+          <summary id="cu-failed-sum"></summary>
+          <ul id="cu-failed-list"></ul>
+        </details>
+        <div class="runs-tools">
+          <div class="search runs-search">
+            <span class="search-icon" data-icon="search"></span>
+            <input id="cu-q" type="search" placeholder="Search title, code or barcode" aria-label="Search this catalogue" autocomplete="off" />
+          </div>
+        </div>
+        <ul class="cat-items" id="cu-items"></ul>
+        <div class="list-empty" id="cu-empty" hidden></div>
+        <div class="runs-more"><button type="button" class="btn btn-secondary" id="cu-more" hidden>Show more</button></div>
       </div>
     </section>
 
@@ -231,6 +352,19 @@
         <div class="alts" id="dr-alts"></div>
       </div>
 
+      <div class="field dr-photos" id="dr-photos" hidden>
+        <span class="field-label" id="dr-photos-label">Photos</span>
+        <p class="dr-photos-note" id="dr-photos-note"></p>
+        <div class="photo-strip" id="dr-photo-strip" role="group" aria-labelledby="dr-photos-label"></div>
+        <div class="dr-desc" id="dr-desc" hidden>
+          <label class="include">
+            <input type="checkbox" id="dr-desc-use" class="check" />
+            <span>Add the catalogue's description</span>
+          </label>
+          <p class="dr-desc-text" id="dr-desc-text"></p>
+        </div>
+      </div>
+
       <div class="field">
         <label for="dr-barcode">Barcode</label>
         <div class="barcode-input">
@@ -297,7 +431,6 @@
     </div>
   </div>
 
-  <datalist id="supplier-list"></datalist>
   <div class="toasts" id="toasts" aria-live="polite"></div>
 </body>
 </html>

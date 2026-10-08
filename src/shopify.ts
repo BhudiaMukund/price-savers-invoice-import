@@ -52,7 +52,7 @@ async function accessToken(env: Env, forceNew = false): Promise<string> {
   return body.access_token;
 }
 
-async function gql<T>(env: Env, query: string, variables: Record<string, unknown> = {}, attempt = 0): Promise<T> {
+export async function gql<T>(env: Env, query: string, variables: Record<string, unknown> = {}, attempt = 0): Promise<T> {
   const url = `https://${env.SHOPIFY_STORE_DOMAIN}/admin/api/${env.SHOPIFY_API_VERSION}/graphql.json`;
   const res = await fetch(url, {
     method: "POST",
@@ -229,11 +229,28 @@ export interface NewProduct {
   importId: string | null;
   /** The run (working session) it was added in, e.g. R42. */
   runCode: string | null;
+  /** Catalogue photos (Shopify CDN addresses), main photo first. The product gets its own copies. */
+  photos?: { url: string; alt: string }[];
+  /** Description from the supplier catalogue, plain text. */
+  description?: string | null;
+  /** Add the import-<ID> and run-<code> tags (the "Tag new products" setting). Default on. */
+  tags?: boolean;
 }
 
 export type CreateResult =
-  | { ok: true; productId: string; published: boolean }
+  | { ok: true; productId: string; published: boolean; photos: number; photoError?: string }
   | { ok: false; error: string };
+
+/** Plain text to safe HTML paragraphs. */
+export function textToHtml(text: string): string {
+  const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return text
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => `<p>${esc(p).replace(/\n/g, "<br>")}</p>`)
+    .join("");
+}
 
 /**
  * Create one ACTIVE product: price 0.00, inventory NOT tracked and NOT a physical/shippable item,
@@ -257,7 +274,7 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
   if (p.barcode) variant.barcode = p.barcode;
   if (p.sku) variant.sku = p.sku;
 
-  type R = { productSet: { product: { id: string } | null; userErrors: { field: string[]; message: string }[] } };
+  type R = { productSet: { product: { id: string } | null; userErrors: { field: string[] | null; message: string }[] } };
   try {
     const input: Record<string, unknown> = {
       title: p.title,
@@ -266,12 +283,23 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
       variants: [variant],
     };
     if (p.vendor) input.vendor = p.vendor;
+    if (p.description?.trim()) input.descriptionHtml = textToHtml(p.description);
+    const photos = (p.photos ?? []).slice(0, 12);
+    // Copies made from the catalogue's photo (Shopify downloads it from its own CDN), not links to it.
+    if (photos.length) input.files = photos.map((ph) => ({ originalSource: ph.url, contentType: "IMAGE", alt: ph.alt.slice(0, 500) }));
     if (p.importId) {
       const f = ctx.importSource;
       input.metafields = [{ namespace: f.namespace, key: f.key, type: f.type, value: importSourceValue(f.type, p.importId) }];
-      if (env.IMPORT_TAGS !== "false") input.tags = [importTag(p.importId), ...(p.runCode ? [`run-${p.runCode}`] : [])];
+      if (p.tags ?? env.IMPORT_TAGS !== "false") input.tags = [importTag(p.importId), ...(p.runCode ? [`run-${p.runCode}`] : [])];
     }
-    const data = await gql<R>(env, mutation, { input });
+    let data = await gql<R>(env, mutation, { input });
+    let photoError: string | undefined;
+    // A photo problem shouldn't stop the product being added: try again without the photos.
+    if (input.files && data.productSet.userErrors.some((e) => (e.field ?? []).includes("files"))) {
+      photoError = data.productSet.userErrors.map((e) => e.message).join("; ");
+      delete input.files;
+      data = await gql<R>(env, mutation, { input });
+    }
     const { product, userErrors } = data.productSet;
     if (userErrors.length || !product) {
       return { ok: false, error: userErrors.map((e) => e.message).join("; ") || "Unknown Shopify error" };
@@ -289,7 +317,7 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
       );
       published = pub.publishablePublish.userErrors.length === 0;
     }
-    return { ok: true, productId: product.id, published };
+    return { ok: true, productId: product.id, published, photos: input.files ? photos.length : 0, ...(photoError ? { photoError } : {}) };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
@@ -374,6 +402,68 @@ export async function addSupplier(env: Env, name: string): Promise<string[]> {
     throw new ShopifyError(`Couldn't save the supplier: ${res.metafieldsSet.userErrors.map((e) => e.message).join("; ")}`);
   }
   return mergeSuppliers(all, [clean]);
+}
+
+export interface SupplierInfo {
+  name: string;
+  /** Saved in this tool's own list (rather than only being a vendor on store products). */
+  saved: boolean;
+  /** Products in the store with this vendor. */
+  products: number;
+}
+
+/** How many store products each vendor has, in one request per 40 vendors. */
+async function vendorCounts(env: Env, vendors: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  for (let i = 0; i < vendors.length; i += 40) {
+    const part = vendors.slice(i, i + 40);
+    const vars = part.map((_, j) => `$q${j}: String`).join(", ");
+    const fields = part.map((_, j) => `v${j}: productsCount(query: $q${j}) { count }`).join(" ");
+    const variables = Object.fromEntries(part.map((v, j) => [`q${j}`, `vendor:"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`]));
+    const data = await gql<Record<string, { count: number } | null>>(env, `query Counts(${vars}) { ${fields} }`, variables);
+    part.forEach((v, j) => out.set(v.toLowerCase(), Number(data[`v${j}`]?.count ?? 0)));
+  }
+  return out;
+}
+
+/** Every supplier, with whether it's saved here and how many store products use it. */
+export async function supplierDetails(env: Env): Promise<SupplierInfo[]> {
+  const [vendors, saved] = await Promise.all([storeVendors(env), savedSuppliers(env)]);
+  const counts = await vendorCounts(env, vendors);
+  const savedKeys = new Set(saved.names.map((n) => cleanSupplierName(n).toLowerCase()));
+  return mergeSuppliers(vendors, saved.names).map((name) => ({
+    name,
+    saved: savedKeys.has(name.toLowerCase()),
+    products: counts.get(name.toLowerCase()) ?? 0,
+  }));
+}
+
+/**
+ * Remove a supplier from this tool's saved list. Refused while any product in the store has it as its
+ * vendor (checked live, so it can't be stale): change those products in Shopify first.
+ */
+export async function removeSupplier(env: Env, name: string): Promise<string[]> {
+  const clean = cleanSupplierName(name);
+  const [vendors, saved] = await Promise.all([storeVendors(env), savedSuppliers(env)]);
+  const inStore = vendors.find((v) => v.toLowerCase() === clean.toLowerCase());
+  if (inStore) {
+    const n = (await vendorCounts(env, [inStore])).get(inStore.toLowerCase()) ?? 0;
+    throw new ShopifyError(
+      `${inStore} is the vendor on ${n === 1 ? "1 product" : `${n} products`} in your store, so it can't be deleted. Change their vendor in Shopify first.`,
+    );
+  }
+  const names = saved.names.filter((n) => cleanSupplierName(n).toLowerCase() !== clean.toLowerCase());
+  if (names.length === saved.names.length) throw new ShopifyError(`${clean} isn't in the saved supplier list.`);
+  type R = { metafieldsSet: { userErrors: { message: string }[] } };
+  const res = await gql<R>(
+    env,
+    `mutation Save($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }`,
+    { m: [{ ownerId: saved.shopId, namespace: SAVED_NS, key: SAVED_KEY, type: "json", value: JSON.stringify(names) }] },
+  );
+  if (res.metafieldsSet.userErrors.length) {
+    throw new ShopifyError(`Couldn't update the supplier list: ${res.metafieldsSet.userErrors.map((e) => e.message).join("; ")}`);
+  }
+  return mergeSuppliers(vendors, names);
 }
 
 /* ------------------------------------------------------------------ undo an import */

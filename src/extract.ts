@@ -1,4 +1,5 @@
 import type { Env, ExtractedItem, InvoiceDetails } from "./types";
+import { streamedBody } from "./streams";
 
 /**
  * Provider-agnostic extraction. Every supplier layout goes through the same prompt + schema,
@@ -100,48 +101,54 @@ type Provider = (env: Env, payload: InvoicePayload, model: string) => Promise<un
 
 const enc = new TextEncoder();
 
-/** Concatenate prefix + streamed body + suffix without buffering the middle. */
-function sandwich(prefix: Uint8Array, middle: ReadableStream<Uint8Array>, suffix: Uint8Array): ReadableStream<Uint8Array> {
-  const reader = middle.getReader();
-  let stage = 0;
-  return new ReadableStream<Uint8Array>({
-    async pull(ctrl) {
-      if (stage === 0) {
-        stage = 1;
-        ctrl.enqueue(prefix);
-        return;
-      }
-      if (stage === 1) {
-        const { done, value } = await reader.read();
-        if (!done) {
-          if (value && value.byteLength) ctrl.enqueue(value);
-          return;
-        }
-        stage = 2;
-      }
-      ctrl.enqueue(suffix);
-      ctrl.close();
-    },
-    cancel(reason) {
-      return reader.cancel(reason);
-    },
+/**
+ * Send one request to Gemini and return the parsed JSON answer. Shared by invoice reading and catalogue
+ * column mapping, so both get the same error messages and retry hints.
+ */
+export async function geminiJson(env: Env, model: string, init: RequestInit & { duplex?: "half" }): Promise<unknown> {
+  if (!env.GEMINI_API_KEY) throw new ExtractionError("The AI key is not set up.");
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const res = await fetch(url, {
+    ...init,
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
   });
-}
+  if (res.status === 429) {
+    throw new ExtractionError("The free AI limit was reached (per minute or per day). Wait a minute and try again.", true);
+  }
+  if (res.status === 503 || res.status === 500 || res.status === 504) {
+    throw new ExtractionError(`Google's AI is overloaded right now (${res.status}). This usually clears within minutes. Try again.`, true);
+  }
+  if (res.status === 404) throw new ExtractionError(`The AI model "${model}" is not available. Update AI_MODEL in wrangler.toml.`, true);
+  if (res.status === 400 || res.status === 401 || res.status === 403) {
+    throw new ExtractionError(`Google refused the request (${res.status}). Check GEMINI_API_KEY is set and the key is allowed to use "${model}".`);
+  }
+  if (!res.ok) throw new ExtractionError(`The AI service returned an error (${res.status}). Try again.`, true);
 
-declare const FixedLengthStream: undefined | (new (length: number) => TransformStream<Uint8Array, Uint8Array>);
+  const out = (await res.json()) as {
+    candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] }; finishReason?: string }[];
+    promptFeedback?: { blockReason?: string };
+  };
+  if (out.promptFeedback?.blockReason) throw new ExtractionError("The AI refused to read this file.");
+  const cand = out.candidates?.[0];
+  if (cand?.finishReason === "MAX_TOKENS") {
+    throw new ExtractionError("This file is too long to read in one go. Split it into smaller files.");
+  }
+  const text = cand?.content?.parts?.filter((p) => !p.thought).map((p) => p.text ?? "").join("") ?? "";
+  if (!text) throw new ExtractionError("The AI returned nothing for this file. Check it and try again.");
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ExtractionError("The AI's answer could not be read. Try again.");
+  }
+}
 
 const gemini: Provider = async (env, payload, model) => {
   if (!env.GEMINI_API_KEY) throw new ExtractionError("The AI key is not set up. Add rows by hand for now.");
-
   const generationConfig = { temperature: 0, responseMimeType: "application/json", responseSchema: SCHEMA };
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-  const headers = { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY };
 
-  let init: RequestInit & { duplex?: "half" };
   if (payload.kind === "text") {
-    init = {
-      method: "POST",
-      headers,
+    return geminiJson(env, model, {
       body: JSON.stringify({
         contents: [
           {
@@ -151,58 +158,17 @@ const gemini: Provider = async (env, payload, model) => {
         ],
         generationConfig,
       }),
-    };
-  } else {
-    const MARK = "\u0000FILE_DATA\u0000";
-    const template = JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: PROMPT }, { inline_data: { mime_type: payload.mimeType, data: MARK } }] }],
-      generationConfig,
     });
-    const marker = JSON.stringify(MARK).slice(1, -1); // as it appears inside the JSON string
-    const at = template.indexOf(marker);
-    const prefix = enc.encode(template.slice(0, at));
-    const suffix = enc.encode(template.slice(at + marker.length));
-    const body = sandwich(prefix, payload.stream, suffix);
-
-    if (typeof FixedLengthStream !== "undefined") {
-      // Workers: send a real Content-Length so the upstream doesn't need chunked encoding.
-      const fixed = new FixedLengthStream(prefix.byteLength + payload.length + suffix.byteLength);
-      body.pipeTo(fixed.writable).catch(() => {});
-      init = { method: "POST", headers, body: fixed.readable };
-    } else {
-      init = { method: "POST", headers, body, duplex: "half" };
-    }
   }
-
-  const res = await fetch(url, init);
-  if (res.status === 429) {
-    throw new ExtractionError("The free AI limit was reached (per minute or per day). Wait a minute and try again, or add rows by hand.", true);
-  }
-  if (res.status === 503 || res.status === 500 || res.status === 504) {
-    throw new ExtractionError(`Google's AI is overloaded right now (${res.status}). This usually clears within minutes. Try again, or add rows by hand.`, true);
-  }
-  if (res.status === 404) throw new ExtractionError(`The AI model "${model}" is not available. Update AI_MODEL in wrangler.toml.`, true);
-  if (res.status === 400 || res.status === 401 || res.status === 403) {
-    throw new ExtractionError(`Google refused the request (${res.status}). Check GEMINI_API_KEY is set and the key is allowed to use "${model}".`);
-  }
-  if (!res.ok) throw new ExtractionError(`The AI service returned an error (${res.status}). Try again, or add rows by hand.`, true);
-
-  const out = (await res.json()) as {
-    candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] }; finishReason?: string }[];
-    promptFeedback?: { blockReason?: string };
-  };
-  if (out.promptFeedback?.blockReason) throw new ExtractionError("The AI refused to read this file. Add rows by hand.");
-  const cand = out.candidates?.[0];
-  if (cand?.finishReason === "MAX_TOKENS") {
-    throw new ExtractionError("This invoice is too long to read in one go. Split it into smaller files.");
-  }
-  const text = cand?.content?.parts?.filter((p) => !p.thought).map((p) => p.text ?? "").join("") ?? "";
-  if (!text) throw new ExtractionError("The AI returned nothing for this file. Check it is an invoice and try again.");
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new ExtractionError("The AI's answer could not be read. Try again.");
-  }
+  const MARK = "\u0000FILE_DATA\u0000";
+  const template = JSON.stringify({
+    contents: [{ role: "user", parts: [{ text: PROMPT }, { inline_data: { mime_type: payload.mimeType, data: MARK } }] }],
+    generationConfig,
+  });
+  const marker = JSON.stringify(MARK).slice(1, -1); // as it appears inside the JSON string
+  const at = template.indexOf(marker);
+  const { body, duplex } = streamedBody(enc.encode(template.slice(0, at)), payload.stream, payload.length, enc.encode(template.slice(at + marker.length)));
+  return geminiJson(env, model, duplex ? { body, duplex } : { body });
 };
 
 const PROVIDERS: Record<string, Provider> = { gemini };

@@ -27,6 +27,33 @@ Upload a supplier invoice (PDF, photo, Excel or CSV) and add the products that a
 - **Ledger**: the server records every product the tool creates (run, invoice, import ID, who, when). An
   invoice can't be removed from its run while any of its products are still in Shopify: delete them with
   Undo import first. The server enforces this, not just the page.
+- **Supplier catalogues** (`/catalogues`): upload a supplier's export (Excel with pictures inside, including
+  Excel 365 "place in cell" pictures; Excel or CSV with photo links; a ZIP; or photos named by code or barcode).
+  AI works out the columns from the first rows (staff can change them), then the browser reads every row.
+  Photos are copied into **Shopify Files** at once, so links that expire later don't matter, and the same
+  picture is never stored twice. Barcodes, codes and descriptions are kept in the site's database. Nothing is
+  created in the store. Then:
+  - Importing an invoice matches each line to the catalogue (by barcode from any supplier, or by supplier code
+    within the invoice's supplier). Matching products get **copies** of the photos (main photo first) and the
+    catalogue's description. Staff can leave photos out, change the main photo, or skip the description in the
+    side panel. A catalogue entry showing several colours on one row has no photos picked by default.
+  - **Fill in missing photos** lists products already in the store with no photo that a catalogue covers, and
+    adds copies.
+  - **Look-alike photos are stored once, automatically.** Every photo gets a visual fingerprint in the browser.
+    A photo that looks the same as one already stored (resized, re-compressed, from a newer export or another
+    supplier) reuses the stored one; a clearly sharper version (1.5x the pixels) replaces it everywhere instead.
+    Matching is strict: a 64 x 64 pixel-by-pixel check must find no clearly different pixels, so number
+    balloons, "30th" vs "40th", or gold vs silver stay separate. Photo links, and photos stored before this
+    check existed, are fingerprinted in the background from Shopify's copy when someone opens the Catalogues
+    pages (this needs Shopify's image server to allow it; if it doesn't, those are simply skipped).
+  - Each upload (C1, C2, …) has its own page. Uploading a newer export from the same supplier replaces the older
+    one; **Undo this upload** stops using it at once (the older one comes back) and deletes its photos from
+    Files, except ones a newer upload also uses. Products keep their own copies.
+- **Settings** (profile menu → Settings, shared by everyone): turn the import/run tags on or off, and whether
+  catalogue photos and descriptions are used automatically. The supplier list shows every supplier with its
+  product count in the store and its catalogues; one that no store product and no active catalogue uses can be
+  deleted (checked live against the store at the moment of deleting). Set `ADMIN_EMAILS` (comma-separated) in
+  `wrangler.toml` to let only those people change settings and delete suppliers; leave it empty for everyone.
 - **Undo import**: deletes the products from one import. As a safety check it only deletes a product whose
   `import_source` holds that import ID and whose price is still $0.00; anything already priced is kept.
 
@@ -54,7 +81,11 @@ The Worker in `src/` handles `/api/*`.
 | `POST /api/extract-file` | PDF / photo as base64, streamed to the AI without parsing (keeps CPU low) |
 | `POST /api/lookup` | Checks up to 50 edited barcodes against the store |
 | `POST /api/match` | Re-checks the whole list against the full catalogue |
-| `POST /api/create` | Creates up to 15 products, re-checking their barcodes first |
+| `POST /api/create` | Creates up to 15 products, re-checking their barcodes first, with catalogue photos and descriptions |
+| `/api/catalogues…` | Catalogue uploads: create, photos (streamed to Shopify Files), links, products, finish, undo |
+| `POST /api/catalogue/match` | Catalogue entries (with photos) for invoice lines |
+| `POST /api/catalogue/map` | AI works out a catalogue spreadsheet's columns from its first rows |
+| `GET /api/catalogue/missing-photos`, `POST /api/catalogue/attach` | Fill in photos on existing products |
 
 ## Testing it
 
@@ -66,15 +97,22 @@ npm run demo
 ```
 
 Open http://localhost:8787 (needs Node 22.13 or newer, for its built-in SQLite). Shopify and the invoice reader are fake: whatever file you upload, you get
-the same sample party-supply invoice, and "adding" only updates the fake store.
+the same sample party-supply invoice, and "adding" only updates the fake store. To try catalogues: on
+Catalogues, upload `test/fixtures/harbour-catalogue.xlsx` (supplier "Harbour Novelty Imports"), then import an
+invoice containing "HARBOUR NOVELTY" (the sample Harbour order) to see the photos picked up. Photo links are
+drawn as stand-in pictures, and links containing "expired" fail, as an expired link would.
 
 ### 2. Your computer, real Shopify and real AI
 
 1. **Shopify app** (since 1 January 2026 Shopify only allows Dev Dashboard apps):
    - Go to dev.shopify.com/dashboard, create an app, and in a new version give it the Admin API scopes
      `read_products`, `write_products`, `read_inventory`, `write_inventory`, `read_locations`,
-     `read_publications`, `write_publications`. Release the version. (`write_products` also covers
-     deleting products for Undo import.)
+     `read_publications`, `write_publications`, `read_files`, `write_files`. Release the version.
+     (`write_products` also covers deleting products for Undo import. The files scopes are for supplier
+     catalogue photos.)
+   - **Already set up before catalogues were added?** Release a new app version that adds `read_files` and
+     `write_files`, then approve the update in the store (or reinstall from the install link). Until then the
+     Catalogues page says the app can't use Files yet; everything else keeps working.
    - Set distribution to custom, generate an install link for your store, and install it.
    - Copy the app's **Client ID** and **Client secret**. The tool swaps these for a 24-hour access token by
      itself and renews it, so there is nothing to refresh by hand.
@@ -144,10 +182,22 @@ site refuses everyone.
   Excel and encodes files, PDFs/photos are streamed rather than parsed, and creation runs in batches of 15.
 - Files: PDFs up to 7 MB. Big phone photos are shrunk in the browser before upload.
 - The full catalogue fetch is one Shopify request per 250 variants; with ~2,000 variants that is 8 requests.
+- Catalogues: each photo is its own request (streamed through to Shopify, never held in memory), three at a
+  time, so a catalogue with 3,000 photos takes a while; keep the page open. Photos already in Files are skipped,
+  so a stopped upload can simply be run again. Photos must be JPG, PNG, GIF or WebP; ones over Shopify's
+  limits (20 MB or 25 megapixels) are shrunk in the browser to 4000 pixels on the long side. Pictures pasted
+  into Excel as EMF/WMF are skipped and counted. Catalogue files are read in the browser, up to 400 MB each
+  (a 200 MB Excel file with 150 large photos reads in about 5 seconds on a computer; use a computer, not a
+  phone, for big files). Old `.xls` files are read, but pictures inside them
+  aren't: save as `.xlsx` first.
 - Products without a barcode can be added, but nothing stops a second copy being added later, because
   matching is by barcode only.
 
 ## Third-party code
 
 `public/vendor/xlsx.core.min.js` is SheetJS Community Edition 0.20.3 (Apache 2.0, see `xlsx.LICENSE.txt`),
-loaded only when someone picks an Excel file.
+loaded only when someone picks an Excel file. `public/vendor/fflate.min.js` is fflate 0.8.2 (MIT, see
+`fflate.LICENSE.txt`), used to open ZIP files and the pictures inside Excel files.
+
+Sample catalogues for trying it out (fictional suppliers matching the sample invoices) are in `test/fixtures/`;
+`python3 test/fixtures/make.py` rebuilds them.

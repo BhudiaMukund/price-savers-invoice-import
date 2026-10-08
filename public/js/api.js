@@ -67,4 +67,37 @@ export const api = {
   suppliers: () => call("/api/suppliers"),
   addSupplier: (name) => call("/api/suppliers", json({ name })),
   undo: (importId, productIds) => call("/api/undo", json({ importId, productIds })),
+
+  // Settings and supplier management
+  saveSettings: (changes) => call("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(changes) }),
+  supplierDetails: () => call("/api/suppliers/details"),
+  deleteSupplier: (name) => call("/api/suppliers", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) }),
+
+  // Supplier catalogues
+  listCatalogues: ({ q = "", before = null } = {}) => call(`/api/catalogues?${new URLSearchParams({ q, ...(before ? { before: String(before) } : {}) })}`),
+  createCatalogue: (supplier, fileNames) => call("/api/catalogues", json({ supplier, fileNames })),
+  getCatalogue: (code) => call(`/api/catalogues/${encodeURIComponent(code)}`),
+  catalogueItems: (code, { q = "", offset = 0 } = {}) => call(`/api/catalogues/${encodeURIComponent(code)}/items?${new URLSearchParams({ q, offset: String(offset) })}`),
+  knownPhotos: (code, fingerprints) => call(`/api/catalogues/${encodeURIComponent(code)}/known`, json({ fingerprints })),
+  uploadPhoto: (code, photo, fingerprint, alt) =>
+    call(`/api/catalogues/${encodeURIComponent(code)}/photo`, {
+      method: "POST",
+      headers: { "Content-Type": photo.type, "X-File-Name": encodeURIComponent(photo.name), "X-Alt": encodeURIComponent(alt.slice(0, 300)), "X-Fingerprint": fingerprint },
+      body: new Blob([photo.bytes], { type: photo.type }),
+    }),
+  photoLinks: (code, links) => call(`/api/catalogues/${encodeURIComponent(code)}/links`, json({ links })),
+  catalogueItemsAdd: (code, items) => call(`/api/catalogues/${encodeURIComponent(code)}/items`, json({ items })),
+  finishCatalogue: (code) => call(`/api/catalogues/${encodeURIComponent(code)}/finish`, { method: "POST" }),
+  undoCatalogue: (code) => call(`/api/catalogues/${encodeURIComponent(code)}/undo`, { method: "POST" }),
+  undoCatalogueStep: (code) => call(`/api/catalogues/${encodeURIComponent(code)}/undo-step`, { method: "POST" }),
+  mapCatalogue: (sample, attempt = 1) =>
+    call("/api/catalogue/map", { method: "POST", headers: { "Content-Type": "application/json", "X-AI-Attempt": String(attempt) }, body: JSON.stringify({ sample }) }),
+  matchCatalogue: (supplier, items) => call("/api/catalogue/match", json({ supplier, items })),
+  missingPhotos: () => call("/api/catalogue/missing-photos"),
+  photoSignatures: () => call("/api/catalogue/signatures"),
+  photosWithoutSignature: () => call("/api/catalogue/signatures/missing"),
+  saveSignatures: (items) => call("/api/catalogue/signatures", json({ items })),
+  photoThumbs: (fileIds) => call("/api/catalogue/thumbs", json({ fileIds })),
+  mergePhotos: (pairs) => call("/api/catalogue/merge", json({ pairs })),
+  attachPhotos: (items) => call("/api/catalogue/attach", json({ items })),
 };

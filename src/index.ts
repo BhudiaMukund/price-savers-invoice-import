@@ -8,6 +8,8 @@ import {
   findVariantsByBarcodes,
   getShopContext,
   listSuppliers,
+  removeSupplier,
+  supplierDetails,
   ShopifyError,
   undoImport,
   type UndoResult,
@@ -17,11 +19,15 @@ import { requireAuth } from "./auth";
 import type { Env, ExtractedItem } from "./types";
 // Note: this is the Worker's main module, so it must only export the app (Cloudflare treats every
 // other export as an entry point). Shared constants live in limits.ts.
-import { IMPORT_ID_RE, MAX_CREATE_BATCH, MAX_UNDO_BATCH } from "./limits";
+import { CATALOGUE_LIMITS, IMPORT_ID_RE, MAX_CREATE_BATCH, MAX_UNDO_BATCH } from "./limits";
 import { RUN_CODE_RE, RunStore, StoreError } from "./store";
+import { catalogueRoutes, type AppEnv } from "./catalogue-routes";
+import { CatalogueStore, FILE_ID_RE } from "./catalogue";
+import { filesAccess } from "./files";
+import { canManage, readSettings, writeSettings, admins } from "./settings";
+import { supplierMatchKey } from "./catalogue";
 
-type App = { Bindings: Env; Variables: { user: string } };
-const app = new Hono<App>();
+const app = new Hono<AppEnv>();
 
 // Every API route requires a valid Cloudflare Access sign-in.
 app.use("/api/*", requireAuth);
@@ -38,7 +44,14 @@ app.onError((err, c) => {
   return c.json({ error: err instanceof Error ? err.message : "Unexpected error" }, 500);
 });
 
-type ClientItem = ExtractedItem & { vendor?: string | null; importId?: string | null; invoiceId?: string | null };
+type ClientItem = ExtractedItem & {
+  vendor?: string | null;
+  importId?: string | null;
+  invoiceId?: string | null;
+  /** Catalogue photos (Shopify file IDs), main photo first. */
+  photos?: string[];
+  description?: string | null;
+};
 
 function runStore(env: Env): RunStore | null {
   return env.DB ? new RunStore(env.DB) : null;
@@ -64,6 +77,8 @@ function readItems(body: unknown, max: number): ClientItem[] | null {
       vendor: str(r.vendor, 100).replace(/\s+/g, " ") || null,
       importId: IMPORT_ID_RE.test(str(r.importId, 64)) ? str(r.importId, 64) : null,
       invoiceId: /^[A-Za-z0-9_-]{1,64}$/.test(str(r.invoiceId, 64)) ? str(r.invoiceId, 64) : null,
+      photos: Array.isArray(r.photos) ? r.photos.filter((p): p is string => typeof p === "string" && FILE_ID_RE.test(p)).slice(0, 12) : [],
+      description: typeof r.description === "string" ? r.description.trim().slice(0, 5000) || null : null,
     };
   });
 }
@@ -79,6 +94,7 @@ app.get("/api/health", async (c) => {
   let shopify = false;
   let posChannel = false;
   let shopifyError: string | null = null;
+  let filesError: string | null = null;
   if (!env.SHOPIFY_STORE_DOMAIN || /your-store/i.test(env.SHOPIFY_STORE_DOMAIN)) {
     shopifyError = "SHOPIFY_STORE_DOMAIN in wrangler.toml is still the placeholder. Set it to your store's .myshopify.com address and deploy again.";
   } else if (!env.SHOPIFY_ADMIN_TOKEN && (!env.SHOPIFY_CLIENT_ID || !env.SHOPIFY_CLIENT_SECRET)) {
@@ -88,6 +104,7 @@ app.get("/api/health", async (c) => {
       const ctx = await getShopContext(env);
       shopify = true;
       posChannel = ctx.posPublicationId !== null;
+      filesError = await filesAccess(env);
     } catch (e) {
       console.error("health: shopify", e);
       shopifyError = e instanceof Error ? e.message : String(e);
@@ -106,6 +123,11 @@ app.get("/api/health", async (c) => {
     maxCreateBatch: MAX_CREATE_BATCH,
     maxUndoBatch: MAX_UNDO_BATCH,
     importTags: env.IMPORT_TAGS !== "false",
+    files: shopify && !filesError,
+    filesError,
+    catalogueLimits: CATALOGUE_LIMITS,
+    settings: await readSettings(env).catch(() => null),
+    canManage: canManage(env, c.get("user")),
   });
 });
 
@@ -207,6 +229,10 @@ app.post("/api/create", async (c) => {
   const existing = await findVariantsByBarcodes(c.env, items.map((i) => i.barcode));
   const rows = classifyItems(items, buildStoreIndex(existing));
   const ctx = await getShopContext(c.env);
+  const settings = await readSettings(c.env);
+  // Catalogue photos: only ones Shopify has finished processing (they have a CDN address).
+  const photoIds = [...new Set(items.flatMap((i) => i.photos ?? []))];
+  const files = photoIds.length ? await new CatalogueStore(c.env.DB!).filesById(photoIds) : new Map();
 
   const results = [];
   const ledger: Parameters<RunStore["recordProducts"]>[0] = [];
@@ -236,6 +262,12 @@ app.post("/api/create", async (c) => {
       vendor: src?.vendor ?? null,
       importId: src?.importId ?? null,
       runCode,
+      photos: (src?.photos ?? [])
+        .map((id) => files.get(id))
+        .filter((f) => f && f.status === "ready" && f.url)
+        .map((f) => ({ url: f!.url!, alt: row.title })),
+      description: src?.description ?? null,
+      tags: settings.importTags,
     });
     if (r.ok) {
       ledger.push({
@@ -250,7 +282,7 @@ app.post("/api/create", async (c) => {
     }
     results.push(
       r.ok
-        ? { id: row.id, status: "created" as const, productId: r.productId, publishedToPos: r.published }
+        ? { id: row.id, status: "created" as const, productId: r.productId, publishedToPos: r.published, photos: r.photos, photoError: r.photoError }
         : { id: row.id, status: "failed" as const, error: r.error },
     );
   }
@@ -302,6 +334,53 @@ app.post("/api/undo", async (c) => {
   const order = new Map(ids.map((id, i) => [id, i]));
   results.sort((a, b) => order.get(a.id)! - order.get(b.id)!);
   return c.json({ results });
+});
+
+/* ------------------------------------------------------------------ settings */
+
+app.get("/api/settings", async (c) =>
+  c.json({ settings: await readSettings(c.env), canManage: canManage(c.env, c.get("user")), adminsSet: admins(c.env).length > 0 }),
+);
+
+app.put("/api/settings", async (c) => {
+  if (!canManage(c.env, c.get("user"))) return c.json({ error: "Only the people listed in ADMIN_EMAILS can change settings." }, 403);
+  if (!c.env.DB) return c.json({ error: NO_DB }, 503);
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null);
+  if (!body || typeof body !== "object") return c.json({ error: "Nothing to save." }, 400);
+  try {
+    await writeSettings(c.env.DB, body, c.get("user"));
+    return c.json({ settings: await readSettings(c.env) });
+  } catch (e) {
+    return storeErrorResponse(e);
+  }
+});
+
+/** Every supplier with how it's used: products in the store, active catalogues, saved here. */
+app.get("/api/suppliers/details", async (c) => {
+  const list = await supplierDetails(c.env);
+  const cats = c.env.DB ? await new CatalogueStore(c.env.DB).activeUploadsBySupplier() : new Map<string, number>();
+  return c.json({
+    suppliers: list.map((s) => ({ ...s, catalogues: cats.get(supplierMatchKey(s.name)) ?? 0 })),
+    canManage: canManage(c.env, c.get("user")),
+  });
+});
+
+/** Delete a supplier that no store product and no active catalogue uses. */
+app.delete("/api/suppliers", async (c) => {
+  if (!canManage(c.env, c.get("user"))) return c.json({ error: "Only the people listed in ADMIN_EMAILS can delete suppliers." }, 403);
+  const body = await c.req.json<{ name?: unknown }>().catch(() => null);
+  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  if (!name) return c.json({ error: "Which supplier?" }, 400);
+  const cats = c.env.DB ? (await new CatalogueStore(c.env.DB).activeUploadsBySupplier()).get(supplierMatchKey(name)) ?? 0 : 0;
+  if (cats) {
+    return c.json({ error: `${name} has ${cats === 1 ? "a catalogue" : `${cats} catalogues`}. Undo ${cats === 1 ? "it" : "them"} on the Catalogues page first.` }, 409);
+  }
+  try {
+    return c.json({ suppliers: await removeSupplier(c.env, name) });
+  } catch (e) {
+    if (e instanceof ShopifyError) return c.json({ error: e.message }, 409);
+    throw e;
+  }
 });
 
 /* ------------------------------------------------------------------ runs */
@@ -357,6 +436,8 @@ app.delete("/api/runs/:code", async (c) => {
     return storeErrorResponse(e);
   }
 });
+
+catalogueRoutes(app);
 
 app.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
 

@@ -37,3 +37,23 @@ describe("import IDs", () => {
     expect(ids.size).toBeGreaterThan(195);
   });
 });
+
+// @ts-ignore -- plain browser module
+import { filterSuppliers, sameSupplier } from "../public/js/supplier-picker.js";
+
+describe("supplier picker", () => {
+  const list = ["Alpen", "Dats", "Goldstar", "IG-Design", "Price Savers", "Toplite"];
+  it("treats other spellings of an existing supplier as that supplier", () => {
+    expect(sameSupplier("ALPEN PTY LTD", list)).toBe("Alpen");
+    expect(sameSupplier("  ig design  ", list)).toBe("IG-Design");
+    expect(sameSupplier("Alpen Australia", list)).toBe("Alpen");
+    expect(sameSupplier("Party Co", list)).toBeNull();
+    expect(sameSupplier("", list)).toBeNull();
+  });
+  it("filters as you type, names starting with the text first", () => {
+    expect(filterSuppliers("", list)).toEqual(list);
+    expect(filterSuppliers("d", list)).toEqual(["Dats", "Goldstar", "IG-Design"]);
+    expect(filterSuppliers("gold", list)).toEqual(["Goldstar"]);
+    expect(filterSuppliers("design", list)).toEqual(["IG-Design"]);
+  });
+});

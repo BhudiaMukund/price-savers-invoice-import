@@ -3,11 +3,14 @@ import { ACCEPT, FileProblem, prepare } from "./files.js";
 import { analyzeBarcode, barsSvg } from "./barcode.js";
 import { icon } from "./icons.js";
 import { findExisting, makeImportId, matchSupplier } from "./suppliers.js";
+import { createCatalogues, thumb } from "./catalogues.js";
+import { sameSupplier, supplierPicker } from "./supplier-picker.js";
+import { createSettings } from "./settings.js";
 
 /* =============================================================== state */
 
 const state = {
-  view: "home", // home | run | runs | loading
+  view: "home", // home | run | runs | loading | catalogues | catalogue
   // The open run: { code, createdBy, createdAt, updatedAt, updatedBy, version, liveByInvoice }
   run: null,
   saveState: "saved", // saved | saving | error | conflict
@@ -46,6 +49,11 @@ function makeRow(fields) {
     selected: false,
     result: null, // { status: "created", productId } | { status: "failed", error }
     adding: false,
+    catalogue: null, // matching supplier catalogue entry (with its photos), or null
+    photos: [], // catalogue photo file IDs to use, main photo first
+    photosTouched: false, // staff changed the photo choice by hand
+    useDescription: true,
+    catKey: "", // what the catalogue was last checked for (barcode | code | supplier)
     ...fields,
   };
 }
@@ -193,6 +201,9 @@ function render() {
   $("#workspace").hidden = v !== "run";
   $("#runs-page").hidden = v !== "runs";
   $("#loading-page").hidden = v !== "loading";
+  $("#cat-page").hidden = v !== "catalogues";
+  $("#catalogue-page").hidden = v !== "catalogue";
+  $("#settings-page").hidden = v !== "settings";
   renderCrumbs();
   if (v !== "run") $("#sources").replaceChildren();
   if (v === "run") {
@@ -202,6 +213,7 @@ function render() {
     renderFilters(snap);
     renderCallout(snap);
     renderList(snap);
+    if (state.rows.some(needsCatalogueCheck)) scheduleCatalogue();
   }
   renderActionBar(snap);
   if (state.drawer) paintDrawer(snap);
@@ -233,30 +245,15 @@ function supplierLocked(src) {
 }
 
 function buildSourceCard(src) {
-  const input = h("input", {
-    class: "sup-input",
+  const picker = supplierPicker({
     id: `sup-${src.id}`,
-    list: "supplier-list",
-    autocomplete: "off",
-    spellcheck: "false",
-    placeholder: "Choose a supplier",
-    maxlength: "100",
+    value: src.supplier ?? "",
+    getSuppliers: () => state.suppliers,
+    onCommit: (name) => commitSupplier(src, name),
+    h,
+    icon,
   });
-  input.addEventListener("input", () => {
-    src.supplier = input.value;
-    src.supplierAuto = false;
-    saveDraft();
-    renderActionBar(snapshot());
-    paintSupplierHint(input.closest("li"), src);
-  });
-  input.addEventListener("change", () => commitSupplier(src, input.value));
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      input.blur();
-    }
-  });
-  return h(
+  const li = h(
     "li",
     { class: "source-card", "data-src": src.id },
     h("button", { type: "button", class: "source" }),
@@ -275,11 +272,13 @@ function buildSourceCard(src) {
       "div",
       { class: "source-extra" },
       h("label", { class: "sup-label", for: `sup-${src.id}` }, "Supplier"),
-      input,
+      picker.el,
       h("p", { class: "sup-hint" }),
       h("div", { class: "source-actions" }),
     ),
   );
+  li._picker = picker;
+  return li;
 }
 
 function paintSupplierHint(li, src) {
@@ -291,15 +290,15 @@ function paintSupplierHint(li, src) {
   else if (supplierLocked(src)) bits.push("Set on the products already added.");
   else if (!name && src.supplierFromInvoice) {
     bits.push(
-      `The invoice says “${src.supplierFromInvoice}”. `,
-      h("button", { type: "button", class: "link", onclick: () => commitSupplier(src, src.supplierFromInvoice) }, "Use this name"),
+      `The invoice says “${src.supplierFromInvoice}”, which isn't one of your suppliers. Pick one from the list, or `,
+      h("button", { type: "button", class: "link", onclick: () => commitSupplier(src, src.supplierFromInvoice) }, "add it as a new supplier"),
+      ".",
     );
     hint.classList.add("is-warn");
   } else if (!name && (src.state === "done" || src.kind === "manual")) {
     bits.push("Choose a supplier before adding.");
     hint.classList.add("is-warn");
-  } else if (name && !findExisting(name, state.suppliers)) bits.push("New supplier. It's saved when you leave this box.");
-  else if (name && src.supplierAuto) bits.push("Matched from the invoice.");
+  } else if (name && src.supplierAuto) bits.push("Matched from the invoice.");
   if (src.invoiceNumber) bits.push(h("span", { class: "sup-inv" }, `Invoice ${src.invoiceNumber}`));
   hint.replaceChildren(...bits);
 }
@@ -352,9 +351,8 @@ function paintSourceCard(li, src, snap) {
   const extra = $(".source-extra", li);
   extra.hidden = src.state === "failed" && !rows.length;
   const input = $(".sup-input", li);
-  if (document.activeElement !== input && input.value !== (src.supplier ?? "")) input.value = src.supplier ?? "";
-  const locked = supplierLocked(src) || !!state.creating;
-  input.readOnly = locked;
+  li._picker.setValue(src.supplier ?? "");
+  li._picker.setDisabled(supplierLocked(src) || !!state.creating);
   input.classList.toggle("is-missing", !(src.supplier ?? "").trim() && (src.state === "done" || src.kind === "manual") && rows.length > 0);
   paintSupplierHint(li, src);
 
@@ -409,12 +407,7 @@ function renderSources(snap) {
 }
 
 function renderSupplierOptions() {
-  const dl = $("#supplier-list");
-  const want = state.suppliers.join("\n");
-  if (dl.dataset.list !== want) {
-    dl.replaceChildren(...state.suppliers.map((n) => h("option", { value: n })));
-    dl.dataset.list = want;
-  }
+  // The supplier pickers read state.suppliers directly each time they open.
 }
 
 /** Products from this invoice that are in Shopify: what this page knows, or what the server's ledger says. */
@@ -474,7 +467,8 @@ async function commitSupplier(src, value) {
     src.supplier = "";
     return render();
   }
-  const existing = findExisting(name, state.suppliers);
+  // Another spelling of an existing supplier ("ALPEN PTY LTD") is that supplier, never a new one.
+  const existing = sameSupplier(name, state.suppliers);
   if (existing) {
     src.supplier = existing;
     return render();
@@ -485,7 +479,7 @@ async function commitSupplier(src, value) {
   try {
     const res = await api.addSupplier(name);
     state.suppliers = res.suppliers;
-    src.supplier = findExisting(name, state.suppliers) ?? name;
+    src.supplier = sameSupplier(name, state.suppliers) ?? name;
     toast("ok", `Added ${src.supplier} to your suppliers.`);
   } catch (err) {
     toast("bad", `Couldn't save ${name} to the supplier list. ${errorText(err)} It'll still be used for these products.`);
@@ -593,9 +587,11 @@ function renderItem(row, status, sourceName) {
   });
   check.checked = selected;
 
+  const photos = rowPhotos(row);
   const meta = h(
     "div",
     { class: "item-meta" },
+    photos.length ? h("span", { class: "item-photos", title: `${plural(photos.length, "photo")} from the ${row.catalogue.supplier} catalogue` }, icon("image", 12), fmt(photos.length)) : null,
     row.supplierCode ? h("span", { class: "mono" }, row.supplierCode) : null,
     row.barcode ? h("span", { class: "item-meta-bar mono" }, row.barcode) : null,
     sourceName ? h("span", {}, sourceName) : null,
@@ -625,13 +621,18 @@ function renderItem(row, status, sourceName) {
     h("div", { class: "item-sel", role: "gridcell" }, check),
     h(
       "div",
-      { class: "item-main", role: "gridcell" },
+      { class: `item-main${photos[0] ? " has-thumb" : ""}`, role: "gridcell" },
+      photos[0] ? h("img", { class: "item-thumb", src: thumb(photos[0].url, 96), alt: "", loading: "lazy", width: 40, height: 40 }) : null,
       h(
         "div",
-        { class: `item-title${title ? "" : " is-empty"}`, title: row.invoiceTitle && row.invoiceTitle !== row.title ? `On the invoice: ${row.invoiceTitle}` : null },
-        title || "No title yet",
+        { class: "item-text" },
+        h(
+          "div",
+          { class: `item-title${title ? "" : " is-empty"}`, title: row.invoiceTitle && row.invoiceTitle !== row.title ? `On the invoice: ${row.invoiceTitle}` : null },
+          title || "No title yet",
+        ),
+        meta,
       ),
-      meta,
     ),
     barCell,
     h("div", { class: "item-status", role: "gridcell" }, badge(status), note ? h("span", { class: "status-note" }, note) : null),
@@ -732,6 +733,138 @@ function sourcesMissingSupplier(rows) {
   return state.sources.filter((s) => ids.has(s.id) && !(s.supplier ?? "").trim());
 }
 
+/* =============================================================== supplier catalogues: photos for invoice lines */
+
+/** The catalogue photos this row will get (ready ones only, in the chosen order). */
+function rowPhotos(row) {
+  if (!row.catalogue || !row.photos?.length) return [];
+  const byId = new Map(row.catalogue.photos.map((p) => [p.fileId, p]));
+  return row.photos.map((id) => byId.get(id)).filter((p) => p && p.status === "ready" && p.url);
+}
+
+function catKeyOf(row) {
+  const src = state.sources.find((s) => s.id === row.sourceId);
+  const code = (row.supplierCode || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return `${analyzeBarcode(row.barcode).key ?? ""}|${code}|${(src?.supplier ?? "").replace(/\s+/g, " ").trim().toLowerCase()}`;
+}
+
+function needsCatalogueCheck(row) {
+  return row.result?.status !== "created" && !row.adding && row.catKey !== catKeyOf(row);
+}
+
+let catTimer = 0;
+let catBusy = false;
+function scheduleCatalogue() {
+  if (catBusy || !state.health?.runs || state.view !== "run") return;
+  clearTimeout(catTimer);
+  catTimer = setTimeout(runCatalogue, 500);
+}
+
+/** Look up the supplier catalogues for rows whose barcode, code or supplier changed. */
+async function runCatalogue() {
+  if (catBusy || state.view !== "run") return;
+  const todo = state.rows.filter(needsCatalogueCheck);
+  if (!todo.length) return;
+  catBusy = true;
+  const keys = new Map(todo.map((r) => [r, catKeyOf(r)]));
+  try {
+    // Nothing to match on: clear without asking.
+    const ask = todo.filter((r) => {
+      if (analyzeBarcode(r.barcode).key || r.supplierCode?.trim()) return true;
+      applyMatch(r, null);
+      r.catKey = keys.get(r);
+      return false;
+    });
+    const bySupplier = new Map();
+    for (const r of ask) {
+      const sup = (state.sources.find((s) => s.id === r.sourceId)?.supplier ?? "").trim();
+      bySupplier.set(sup, [...(bySupplier.get(sup) ?? []), r]);
+    }
+    for (const [supplier, rows] of bySupplier) {
+      for (let i = 0; i < rows.length; i += 300) {
+        const batch = rows.slice(i, i + 300);
+        const { matches } = await api.matchCatalogue(supplier, batch.map(({ id, barcode, supplierCode }) => ({ id, barcode, supplierCode })));
+        for (const r of batch) {
+          if (catKeyOf(r) !== keys.get(r)) continue; // edited again meanwhile
+          applyMatch(r, matches[r.id] ?? null);
+          r.catKey = keys.get(r);
+        }
+      }
+    }
+  } catch (err) {
+    if (err instanceof SessionExpired) sessionExpired();
+    for (const r of todo) r.catKey = keys.get(r); // don't keep asking; "Check again" or an edit retries
+  } finally {
+    catBusy = false;
+    render();
+  }
+  // Photos Shopify is still processing: look again shortly.
+  const waiting = state.rows.filter((r) => r.result?.status !== "created" && r.catalogue?.photos.some((p) => p.status === "processing"));
+  if (waiting.length) {
+    setTimeout(() => {
+      for (const r of waiting) if ((r.catTries = (r.catTries ?? 0) + 1) < 20) r.catKey = "";
+      scheduleCatalogue();
+    }, 8000);
+  }
+}
+
+function applyMatch(row, m) {
+  if (!m) {
+    row.catalogue = null;
+    row.photos = [];
+    return;
+  }
+  const usable = m.photos.filter((p) => p.status === "ready" || p.status === "processing").map((p) => p.fileId);
+  const same = row.catalogue?.itemId === m.itemId;
+  const auto = state.health?.settings?.cataloguePhotos !== false;
+  if (!same) {
+    // A catalogue entry showing several colours: staff pick the right photo.
+    row.photos = m.mixed || !auto ? [] : usable;
+    row.photosTouched = false;
+    row.useDescription = state.health?.settings?.catalogueDescriptions !== false;
+  } else if (!row.photosTouched && !m.mixed && auto) row.photos = usable;
+  else row.photos = row.photos.filter((id) => usable.includes(id));
+  row.catalogue = m;
+}
+
+function paintDrawerPhotos(row, lock) {
+  const box = $("#dr-photos");
+  const m = row.catalogue;
+  box.hidden = !m;
+  if (!m) return;
+  const used = rowPhotos(row).length;
+  $("#dr-photos-label").textContent = m.photos.length ? `Photos (${used} of ${m.photos.length} used)` : "Supplier catalogue";
+  const note = $("#dr-photos-note");
+  note.className = `dr-photos-note${m.mixed && !row.photos.length ? " is-warn" : ""}`;
+  note.replaceChildren(
+    `From the ${m.supplier} catalogue (${m.catalogue}), matched by ${m.by === "barcode" ? "barcode" : "supplier code"}. `,
+    m.mixed
+      ? "It shows several colours or styles, so pick the photo that matches this product."
+      : m.photos.length
+        ? "Ticked photos are added. Click one to add or leave it out; right-click it (or press and hold) to make it the main photo."
+        : "It has no photos.",
+  );
+  $("#dr-photo-strip").replaceChildren(
+    ...(m.photos.length
+      ? [
+          catalogues.photoPicker(m.photos, row.photos, (next) => {
+            row.photos = next;
+            row.photosTouched = true;
+            render();
+          }, lock),
+        ]
+      : []),
+  );
+  const desc = $("#dr-desc");
+  desc.hidden = !m.description;
+  if (m.description) {
+    $("#dr-desc-text").textContent = m.description;
+    const cb = $("#dr-desc-use");
+    cb.checked = row.useDescription !== false;
+    cb.disabled = lock;
+  }
+}
+
 /* =============================================================== drawer */
 
 let lastFocus = null;
@@ -829,6 +962,8 @@ function paintDrawer(snap) {
   const cur = row.title.trim();
   if (row.invoiceTitle && row.invoiceTitle !== cur) alts.push(["On the invoice", row.invoiceTitle, "Use invoice wording"]);
   if (row.aiTitle && row.aiTitle !== cur) alts.push(["Tidied title", row.aiTitle, "Use tidied title"]);
+  const catTitle = row.catalogue?.title?.trim();
+  if (catTitle && catTitle.toLowerCase() !== cur.toLowerCase() && catTitle !== row.invoiceTitle) alts.push(["In the catalogue", catTitle, "Use catalogue name"]);
   $("#dr-alts").replaceChildren(
     ...alts.map(([label, text, action]) =>
       h(
@@ -855,6 +990,8 @@ function paintDrawer(snap) {
       ),
     ),
   );
+
+  paintDrawerPhotos(row, lock);
 
   // Big barcode
   const big = $("#dr-bars");
@@ -1077,6 +1214,11 @@ function wireDrawer() {
     if (state.drawer?.fix) nextIssue();
     else stepDrawer(1);
   });
+  $("#dr-desc-use").addEventListener("change", (e) => {
+    const row = drawerRow();
+    if (row) row.useDescription = e.target.checked;
+    render();
+  });
   $("#dr-include").addEventListener("change", (e) => {
     const row = drawerRow();
     if (row) row.selected = e.target.checked;
@@ -1261,6 +1403,10 @@ const person = (email) => (email && email === state.health?.user ? "you" : email
 function currentRoute() {
   const p = location.pathname.replace(/\/+$/, "") || "/";
   if (p === "/runs") return { view: "runs" };
+  if (p === "/catalogues") return { view: "catalogues" };
+  if (p === "/settings") return { view: "settings" };
+  const c = p.match(/^\/catalogues\/(C\d+)$/i);
+  if (c) return { view: "catalogue", code: c[1].toUpperCase() };
   const m = p.match(/^\/runs\/(R\d+)$/i);
   if (m) return { view: "run", code: m[1].toUpperCase() };
   return { view: "home" };
@@ -1278,6 +1424,7 @@ async function navigate(path, { replace = false } = {}) {
     if (busyReading() && !confirm("An invoice is still being read. Leave this run anyway? It will be stopped.")) return;
     await flushSave();
   }
+  if (catalogues.busy() && !confirm("A catalogue is still being saved. Leave anyway? It will stop part way.")) return;
   history[replace ? "replaceState" : "pushState"]({}, "", path);
   route();
 }
@@ -1289,12 +1436,18 @@ async function route() {
     return openRun(r.code);
   }
   if (state.view === "run") resetAll();
+  if (state.view === "catalogue" && r.view !== "catalogue") catalogues.leave();
   state.run = null;
   state.view = r.view;
   setSaveState("saved");
   render();
   if (r.view === "home") loadRecent();
   if (r.view === "runs") loadRuns({ reset: true });
+  if (r.view === "catalogues") catalogues.loadList();
+  if (r.view === "catalogue") catalogues.showUpload(r.code);
+  if (r.view === "settings") settingsPage.show();
+  $("#account-menu").hidden = true;
+  $("#avatar").setAttribute("aria-expanded", "false");
   window.scrollTo(0, 0);
 }
 
@@ -1316,6 +1469,8 @@ async function openRun(code, { quiet = false } = {}) {
       s.state === "reading" || s.state === "queued" ? { ...s, state: "failed", message: "Interrupted. Add this file again." } : s,
     );
     state.rows = (data.rows ?? []).map((r) => makeRow({ ...r, adding: false }));
+    // Photos Shopify was still processing when this run was saved: look them up again.
+    for (const r of state.rows) if (r.catalogue?.photos?.some((p) => p.status === "processing")) r.catKey = "";
     state.store = data.store ?? null;
     state.view = "run";
     lastSaved = runDataJson();
@@ -1362,7 +1517,17 @@ function renderCrumbs() {
   $(".crumb-run-sep").hidden = !code;
   crumb.textContent = code ? `Run ${code}` : "";
   $("#nav-runs").classList.toggle("is-current", state.view === "runs");
-  document.title = code ? `Run ${code} | Invoice Import` : state.view === "runs" ? "Runs | Invoice Import" : "Invoice Import";
+  $("#nav-catalogues").classList.toggle("is-current", state.view === "catalogues" || state.view === "catalogue");
+  if (state.view === "catalogue") return; // its page sets the title once loaded
+  document.title = code
+    ? `Run ${code} | Invoice Import`
+    : state.view === "runs"
+      ? "Runs | Invoice Import"
+      : state.view === "catalogues"
+        ? "Catalogues | Invoice Import"
+        : state.view === "settings"
+          ? "Settings | Invoice Import"
+          : "Invoice Import";
 }
 
 function renderRunBar(snap) {
@@ -1497,6 +1662,8 @@ async function addFiles(list) {
   const files = [...list];
   if (!files.length) return;
   if (state.sessionExpired) return sessionExpired();
+  if (state.view === "catalogues") return catalogues.startUpload(files);
+  if (state.view === "catalogue") return toast("info", "To add a catalogue, go to Catalogues and choose Add a catalogue.");
   if (state.view === "runs" || state.view === "loading") return toast("info", "Open a run, or start a new import from the home page, to add invoices.");
   if (!(await ensureRun())) return;
   for (const file of files) {
@@ -1678,7 +1845,7 @@ function confirmDialog({ title, facts, ok, danger = false }) {
   return new Promise((res) => dlg.addEventListener("close", () => res(dlg.returnValue === "ok"), { once: true }));
 }
 
-function confirmAdd(count, noBarcode, groups) {
+function confirmAdd(count, noBarcode, groups, withPhotos = 0) {
   const what = count === 1 ? "1 product" : `${fmt(count)} products`;
   const supplierText = groups.map((g) => (groups.length > 1 ? `${g.supplier} (${g.count})` : g.supplier)).join(", ");
   return confirmDialog({
@@ -1689,6 +1856,7 @@ function confirmAdd(count, noBarcode, groups) {
       fact("alert", "Priced at $0.00. ", "Set prices in the POS app before selling."),
       fact("scan", "In-store only. ", "Not shippable, and stock isn't tracked."),
       fact("hand", `Supplier: ${supplierText}. `, groups.length > 1 ? "Each invoice gets its own import ID." : `Import ID ${groups[0].importId}.`),
+      withPhotos ? fact("image", `${withPhotos === count ? (count === 1 ? "It gets" : "All get") : `${fmt(withPhotos)} get`} photos `, "from your supplier catalogues.") : null,
       noBarcode
         ? fact("alert", `${noBarcode === 1 ? "1 product has" : `${fmt(noBarcode)} products have`} no barcode, `, `so the till can't scan ${noBarcode === 1 ? "it" : "them"} yet.`, true)
         : null,
@@ -1725,12 +1893,13 @@ async function addSelected() {
   const bySource = new Map(state.sources.map((s) => [s.id, s]));
 
   const noBarcode = chosen.filter((r) => snap.status.get(r.id) === "missing").length;
-  if (!(await confirmAdd(chosen.length, noBarcode, groups))) return;
+  const withPhotos = chosen.filter((r) => rowPhotos(r).length).length;
+  if (!(await confirmAdd(chosen.length, noBarcode, groups, withPhotos))) return;
 
   closeDrawerSilently();
   const size = state.health?.maxCreateBatch ?? 15;
   state.creating = { done: 0, total: chosen.length };
-  const tally = { created: 0, skipped: 0, failed: 0, notOnPos: 0 };
+  const tally = { created: 0, skipped: 0, failed: 0, notOnPos: 0, photos: 0, photoErrors: 0 };
   render();
 
   for (let i = 0; i < chosen.length; i += size) {
@@ -1740,11 +1909,13 @@ async function addSelected() {
     try {
       const res = await api.create(
         state.run.code,
-        batch.map(({ id, title, supplierCode, barcode, sourceId }) => ({
+        batch.map(({ id, title, supplierCode, barcode, sourceId, photos, catalogue, useDescription }) => ({
           id,
           title,
           supplierCode,
           barcode,
+          photos: catalogue ? photos : [],
+          description: catalogue?.description && useDescription !== false ? catalogue.description : null,
           invoiceId: sourceId,
           vendor: bySource.get(sourceId)?.supplier.trim() || null,
           importId: bySource.get(sourceId)?.importId ?? null,
@@ -1758,6 +1929,8 @@ async function addSelected() {
           row.result = { status: "created", productId: r.productId };
           row.selected = false;
           tally.created++;
+          if (r.photos) tally.photos++;
+          if (r.photoError) tally.photoErrors++;
           if (r.publishedToPos === false) tally.notOnPos++;
         } else if (r?.status === "skipped") {
           row.selected = false;
@@ -1791,6 +1964,9 @@ async function addSelected() {
 
   state.creating = null;
   render();
+  if (tally.photoErrors) {
+    toast("bad", `${plural(tally.photoErrors, "product was", "products were")} added without photos because Shopify refused them. Add the photos in Shopify, or try Fill in missing photos on the Catalogues page.`, { sticky: true });
+  }
   showDone(tally, groups);
 }
 
@@ -1848,7 +2024,7 @@ async function undoImport(src) {
   toast(tally.failed ? "bad" : "ok", parts.join(" "), { sticky: tally.priced + tally.other + tally.failed > 0 });
 }
 
-function showDone({ created, skipped, failed, notOnPos }, groups = []) {
+function showDone({ created, skipped, failed, notOnPos, photos = 0 }, groups = []) {
   const dlg = $("#done");
   const mark = $("#dn-mark");
   mark.className = `done-mark${failed || notOnPos ? " is-partial" : ""}`;
@@ -1856,6 +2032,7 @@ function showDone({ created, skipped, failed, notOnPos }, groups = []) {
   $("#dn-title").textContent = created === 0 ? "Nothing was added" : created === 1 ? "1 product added" : `${fmt(created)} products added`;
   const bits = [];
   if (created && notOnPos < created) bits.push("They're on Point of Sale now. Set their prices in the POS app.");
+  if (photos) bits.push(`${photos === created ? (created === 1 ? "It has" : "All have") : `${fmt(photos)} have`} photos from the catalogue.`);
   if (notOnPos) bits.push(`${plural(notOnPos, "was", "were")} created but couldn't be put on Point of Sale. In Shopify, open ${notOnPos === 1 ? "it" : "them"} and turn on the Point of Sale channel.`);
   if (skipped) bits.push(`${plural(skipped, "was", "were")} already in your store, so ${skipped === 1 ? "it was" : "they were"} skipped.`);
   if (failed) bits.push(`${plural(failed, "product", "products")} couldn't be added. ${failed === 1 ? "It's" : "They're"} under Needs a look.`);
@@ -1909,6 +2086,29 @@ function showDone({ created, skipped, failed, notOnPos }, groups = []) {
 
 /* =============================================================== start up */
 
+const settingsPage = createSettings({ api, h, $, icon, toast, confirmDialog, fact, errorText, plural, state, SessionExpired, sessionExpired: () => sessionExpired() });
+
+const catalogues = createCatalogues({
+  api,
+  h,
+  $,
+  icon,
+  toast,
+  confirmDialog,
+  fact,
+  errorText,
+  plural,
+  fmt,
+  fmtWhen,
+  person,
+  findExisting,
+  matchSupplier,
+  state,
+  SessionExpired,
+  ApiError,
+  sessionExpired: () => sessionExpired(),
+});
+
 async function checkHealth() {
   try {
     const hl = await api.health();
@@ -1923,6 +2123,7 @@ async function checkHealth() {
       toast("bad", `Shopify isn't connected, so products can't be checked or added. ${hl.shopifyError ?? ""}`.trim(), { sticky: true, id: "shopify" });
     }
     else if (!hl.posChannel) toast("bad", "The Point of Sale channel wasn't found. New products would be created but not shown on POS.", { sticky: true, id: "pos" });
+    if (state.view === "settings") settingsPage.renderToggles();
   } catch (err) {
     if (err instanceof SessionExpired) return sessionExpired();
     $("#conn").dataset.state = "bad";
@@ -2089,7 +2290,7 @@ function wire() {
   $("#run-delete").addEventListener("click", deleteRun);
 
   addEventListener("beforeunload", (e) => {
-    if (hasUnsaved() || busyReading()) {
+    if (hasUnsaved() || busyReading() || catalogues.busy()) {
       e.preventDefault();
       e.returnValue = "";
     }
@@ -2100,6 +2301,8 @@ function wire() {
   });
 
   wireDrawer();
+  catalogues.wire();
+  settingsPage.wire();
 }
 
 wire();

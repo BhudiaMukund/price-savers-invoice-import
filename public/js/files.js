@@ -22,7 +22,7 @@ function typeOf(file) {
 }
 
 let xlsxLoading = null;
-function loadSheetJS() {
+export function loadSheetJS() {
   if (window.XLSX) return Promise.resolve(window.XLSX);
   xlsxLoading ??= new Promise((resolve, reject) => {
     const s = document.createElement("script");
