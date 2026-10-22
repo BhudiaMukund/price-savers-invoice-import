@@ -38,7 +38,7 @@ export function classifyItems(items: ExtractedItem[], index: StoreIndex): Review
         return {
           ...base,
           match: "exists",
-          existing: { productId: hit.productId, title: hit.title, handle: hit.handle },
+          existing: { productId: hit.productId, title: hit.title, handle: hit.handle, ...(hit.status ? { status: hit.status } : {}) },
         };
       }
       if (seen.has(bc.key)) return { ...base, match: "duplicate_in_invoice" };

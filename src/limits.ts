@@ -26,6 +26,8 @@ export const CATALOGUE_LIMITS = {
   undoBatch: 50,
   /** Look-alike photos: fingerprints saved, thumbnails fetched, pairs merged per request. */
   signatureBatch: 50,
+  /** Fingerprints sent per page when the page loads the stored ones. */
+  signaturePage: 500,
   thumbBatch: 200,
   mergeBatch: 25,
 } as const;

@@ -33,6 +33,24 @@ export function safeFileName(name: string, fallbackExt = "jpg"): string {
 }
 
 /**
+ * Shopify insists the file name's extension is exactly the link's own (".JPG" stays ".JPG", ".jpeg" stays
+ * ".jpeg"), so the name takes the extension from the link. A link with no extension gets no name at all
+ * and Shopify names it from the link.
+ */
+export function withSourceExt(fileName: string, source: string): { filename?: string } {
+  let path = source;
+  try {
+    path = decodeURIComponent(new URL(source).pathname);
+  } catch {
+    /* keep the raw text */
+  }
+  const ext = path.match(/\.([A-Za-z0-9]{2,5})$/)?.[1];
+  if (!ext) return {};
+  const stem = safeFileName(fileName).replace(/\.[a-z0-9]+$/, "");
+  return { filename: `${stem}.${ext}` };
+}
+
+/**
  * Upload one photo's bytes into Shopify Files, streamed straight through without being held in memory:
  * ask Shopify for an upload slot, post the bytes there, then create the file from it.
  */
@@ -115,10 +133,15 @@ function toInfo(n: FileNode): PhotoInfo & { error?: string } {
 /**
  * Create files from URLs (a photo link in a supplier export, or an upload slot). Shopify downloads each one
  * itself, so links that expire later don't matter once this has run. One bad link doesn't stop the others.
+ *
+ * When Shopify refuses some of a batch, its error says which ones (the position in "field"), so those are
+ * marked and the rest are sent again in one call. Trying every link on its own took 25+ calls in a single
+ * request, which Cloudflare cuts off, and it failed the same way on every retry.
  */
 export async function createFiles(
   env: Env,
   files: { source: string; fileName?: string; alt: string }[],
+  calls = { left: 6 },
 ): Promise<((PhotoInfo & { error?: string }) | { error: string })[]> {
   if (!files.length) return [];
   type R = { fileCreate: { files: FileNode[] | null; userErrors: UserError[] } };
@@ -129,21 +152,49 @@ export async function createFiles(
     originalSource: f.source,
     contentType: "IMAGE",
     alt: f.alt.slice(0, 500),
-    ...(f.fileName ? { filename: f.fileName } : {}),
+    ...(f.fileName ? withSourceExt(f.fileName, f.source) : {}),
   });
-  let res: R;
-  try {
-    res = await gql<R>(env, mutation, { files: files.map(input) });
-  } catch (e) {
-    throw new ShopifyError(filesError(e));
+  const out: ((PhotoInfo & { error?: string }) | { error: string })[] = new Array(files.length);
+  let pending = files.map((_, i) => i);
+  while (pending.length && calls.left > 0) {
+    calls.left--;
+    let res: R;
+    try {
+      res = await gql<R>(env, mutation, { files: pending.map((i) => input(files[i]!)) });
+    } catch (e) {
+      throw new ShopifyError(filesError(e));
+    }
+    const errors = res.fileCreate.userErrors;
+    if (!errors.length && res.fileCreate.files?.length === pending.length) {
+      res.fileCreate.files.forEach((n, k) => (out[pending[k]!] = toInfo(n)));
+      pending = [];
+      break;
+    }
+    // Which of this call's files did Shopify refuse? ("field" is ["files", "3", "originalSource"]).
+    const bad = new Map<number, string>();
+    for (const e of errors) {
+      const at = Number(e.field?.[1]);
+      if (e.field?.[0] === "files" && Number.isInteger(at) && at >= 0 && at < pending.length) bad.set(at, [bad.get(at), e.message].filter(Boolean).join("; "));
+    }
+    if (bad.size) {
+      bad.forEach((message, at) => (out[pending[at]!] = { error: message }));
+      pending = pending.filter((_, k) => !bad.has(k));
+      continue; // the rest go again in one call
+    }
+    // Refused without saying which: split the batch in two and ask about each half.
+    const message = errors.map((e) => e.message).join("; ") || "Shopify refused these photos.";
+    if (pending.length === 1) {
+      out[pending[0]!] = { error: message };
+      pending = [];
+      break;
+    }
+    const half = Math.ceil(pending.length / 2);
+    const first = await createFiles(env, pending.slice(0, half).map((i) => files[i]!), calls);
+    const second = await createFiles(env, pending.slice(half).map((i) => files[i]!), calls);
+    [...first, ...second].forEach((r, k) => (out[pending[k]!] = r));
+    pending = [];
   }
-  if (!res.fileCreate.userErrors.length && res.fileCreate.files?.length === files.length) {
-    return res.fileCreate.files.map(toInfo);
-  }
-  // Something in the batch was refused: try each on its own so we know which.
-  if (files.length === 1) return [{ error: res.fileCreate.userErrors.map((e) => e.message).join("; ") || "Shopify refused this photo." }];
-  const out: ((PhotoInfo & { error?: string }) | { error: string })[] = [];
-  for (const f of files) out.push(...(await createFiles(env, [f])));
+  for (const i of pending) out[i] = { error: "Shopify was too busy to take this photo. Try the catalogue again." };
   return out;
 }
 
@@ -178,23 +229,50 @@ export async function deleteFiles(env: Env, ids: string[]): Promise<string[]> {
  * Give an existing product copies of catalogue photos. Copies (not links to the catalogue's file) so that
  * deleting the product later can't take the catalogue's photo with it.
  */
-export async function addPhotosToProduct(env: Env, productId: string, photos: { url: string; alt: string }[]): Promise<string | null> {
-  type R = { productUpdate: { product: { id: string } | null; userErrors: UserError[] } };
+export async function addPhotosToProduct(
+  env: Env,
+  productId: string,
+  photos: { url: string; alt: string }[],
+): Promise<{ error: string | null; mediaIds: string[] }> {
+  type R = { productUpdate: { product: { id: string; media?: { nodes: { id: string }[] } } | null; userErrors: UserError[] } };
   try {
     const res = await gql<R>(
       env,
+      // (Shopify's newer API versions refuse `media(last: n)` without `before`, so read the first 250 and take the end.)
       `mutation Add($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
-         productUpdate(product: $product, media: $media) { product { id } userErrors { field message } }
+         productUpdate(product: $product, media: $media) { product { id media(first: 250) { nodes { id } } } userErrors { field message } }
        }`,
       { product: { id: productId }, media: photos.map((p) => ({ originalSource: p.url, mediaContentType: "IMAGE", alt: p.alt.slice(0, 500) })) },
     );
     if (res.productUpdate.userErrors.length || !res.productUpdate.product) {
-      return res.productUpdate.userErrors.map((e) => e.message).join("; ") || "Shopify didn't add the photos.";
+      return { error: res.productUpdate.userErrors.map((e) => e.message).join("; ") || "Shopify didn't add the photos.", mediaIds: [] };
     }
-    return null;
+    // The new copies are the last ones on the product.
+    return { error: null, mediaIds: (res.productUpdate.product.media?.nodes ?? []).map((m) => m.id).slice(-photos.length) };
   } catch (e) {
-    return e instanceof Error ? e.message : String(e);
+    return { error: e instanceof Error ? e.message : String(e), mediaIds: [] };
   }
+}
+
+/** Store products by ID, with whether they have a photo (null when the product no longer exists). */
+export async function productsByIds(env: Env, ids: string[]): Promise<Map<string, (ProductWithoutPhotos & { hasPhotos: boolean }) | null>> {
+  const out = new Map<string, (ProductWithoutPhotos & { hasPhotos: boolean }) | null>();
+  type N = { id: string; title: string; handle: string; vendor: string; featuredMedia: { id: string } | null; variants: { nodes: { barcode: string | null; sku: string | null }[] } } | null;
+  for (let i = 0; i < ids.length; i += 100) {
+    const part = ids.slice(i, i + 100);
+    const data = await gql<{ nodes: N[] }>(
+      env,
+      `query P($ids: [ID!]!) { nodes(ids: $ids) { ... on Product { id title handle vendor featuredMedia { id } variants(first: 1) { nodes { barcode sku } } } } }`,
+      { ids: part },
+    );
+    part.forEach((id, j) => {
+      const n = data.nodes[j];
+      if (!n || !n.id) return out.set(id, null);
+      const v = n.variants.nodes[0];
+      out.set(id, { productId: n.id, title: n.title, handle: n.handle, vendor: n.vendor ?? "", barcode: v?.barcode ?? "", sku: v?.sku ?? "", hasPhotos: Boolean(n.featuredMedia) });
+    });
+  }
+  return out;
 }
 
 export interface ProductWithoutPhotos {

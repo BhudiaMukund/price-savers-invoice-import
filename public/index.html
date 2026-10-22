@@ -23,7 +23,7 @@
         <span class="mark" aria-hidden="true">
           <svg viewBox="0 0 32 32" width="28" height="28"><rect width="32" height="32" rx="8" /><path d="M8 8h2v16H8zm4 0h1v16h-1zm3 0h3v16h-3zm5 0h1v16h-1zm3 0h1v16h-1z" /></svg>
         </span>
-        <span class="appbar-shop">Price Savers</span>
+        <span class="appbar-shop">Price Savers SA</span>
       </a>
       <span class="appbar-sep" aria-hidden="true">/</span>
       <a class="appbar-tool" href="/" data-nav>Invoice import</a>
@@ -185,7 +185,7 @@
             <input id="cat-q" type="search" placeholder="Search by supplier or file" aria-label="Search catalogue uploads" autocomplete="off" />
           </div>
         </div>
-        <ul class="run-list" id="cat-list" aria-live="polite"></ul>
+        <div class="cat-groups" id="cat-list" aria-live="polite"></div>
         <div class="list-empty" id="cat-empty" hidden></div>
         <div class="runs-more"><button type="button" class="btn btn-secondary" id="cat-more" hidden>Show older uploads</button></div>
       </div>
@@ -224,6 +224,15 @@
           </div>
           <ul class="set-sups" id="set-suppliers"></ul>
         </section>
+
+        <aside class="credit" aria-label="About this site">
+          <svg class="credit-mark" viewBox="0 0 32 32" width="40" height="40" aria-hidden="true"><rect width="32" height="32" rx="8" /><path d="M8 8h2v16H8zm4 0h1v16h-1zm3 0h3v16h-3zm5 0h1v16h-1zm3 0h1v16h-1z" /></svg>
+          <p class="credit-text">
+            <span class="credit-lead">Designed and coded by</span>
+            <a class="credit-name" href="https://mukundbhudia.com" target="_blank" rel="noopener">Mukund Bhudia</a>
+            <span class="credit-for">for <a href="https://pricesaverssa.com.au" target="_blank" rel="noopener">Price Savers SA</a></span>
+          </p>
+        </aside>
       </div>
     </section>
 
@@ -236,7 +245,7 @@
             <h1 id="cu-title"></h1>
             <p class="runs-sub" id="cu-sub"></p>
           </div>
-          <button type="button" class="btn btn-ghost btn-danger" id="cu-undo" hidden><span class="btn-icon" data-icon="trash"></span>Undo this upload</button>
+          <button type="button" class="btn btn-ghost btn-danger" id="cu-undo" hidden><span class="btn-icon" data-icon="trash"></span>Remove catalogue</button>
         </div>
         <div class="cu-stats" id="cu-stats"></div>
         <div class="cat-banner" id="cu-banner" hidden></div>
@@ -287,6 +296,10 @@
           <div>
             <h2 class="review-title">Review products</h2>
             <p class="review-sub" id="review-sub"></p>
+            <label class="stock-switch" for="stock-toggle">
+              <span class="switch"><input type="checkbox" class="switch-input" id="stock-toggle" role="switch" checked /><span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span></span>
+              <span class="stock-switch-text"><strong>Update stock from these invoices</strong><small id="stock-hint"></small></span>
+            </label>
           </div>
           <div class="review-tools">
             <div class="search">
@@ -405,6 +418,22 @@
       <div class="modal-actions">
         <button value="cancel" class="btn btn-secondary">Cancel</button>
         <button value="ok" class="btn btn-brand" id="cf-ok"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Strict confirm: type a code to go ahead -->
+  <dialog class="modal modal-strict" id="strict" aria-labelledby="st-title">
+    <form method="dialog">
+      <div class="strict-mark" data-icon="alert"></div>
+      <h2 id="st-title"></h2>
+      <p class="strict-text" id="st-text"></p>
+      <ul class="strict-list" id="st-list"></ul>
+      <label class="strict-label" for="st-input" id="st-label"></label>
+      <input class="strict-input mono" id="st-input" autocomplete="off" autocapitalize="characters" spellcheck="false" />
+      <div class="modal-actions">
+        <button value="cancel" class="btn btn-secondary">Cancel</button>
+        <button value="ok" class="btn btn-danger-solid" id="st-ok" disabled></button>
       </div>
     </form>
   </dialog>

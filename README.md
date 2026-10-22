@@ -30,6 +30,18 @@ Upload a supplier invoice (PDF, photo, Excel or CSV) and add the products that a
 - **Supplier catalogues** (`/catalogues`): upload a supplier's export (Excel with pictures inside, including
   Excel 365 "place in cell" pictures; Excel or CSV with photo links; a ZIP; or photos named by code or barcode).
   AI works out the columns from the first rows (staff can change them), then the browser reads every row.
+  Several spreadsheets can be picked at once (e.g. a portal that exports one file per page of its range): every
+  file with the same headings as the chosen sheet is read, and products in more than one are merged by barcode
+  or code. Files with different headings are named as left out. Pictures inside old `.xls` files can't be read
+  Pictures inside old `.xls` files are read too (including bitmaps, converted to PNG), and a photo-link column
+  with no heading ("Click to preview") is found by its links. A picture and a link to it on the same product
+  count as one photo: the link (full size) is used and the sheet's small picture is only a spare, in case the
+  links don't open from the browser. The same picture twice on a product is merged (even when one copy was stretched to fit a
+  cell), straight away for pictures in the files and after Shopify fetches the link for linked ones.
+  Alt text and file names use the readable product name (abbreviations like ASST, pack ratios like 12/60 and
+  colour initials like R-B-Y are spelled out) and leave out the supplier code.
+  The page tells a busy server apart from an expired sign-in, repeats safe calls a few times, and the
+  fingerprint list is loaded in pages.
   Photos are copied into **Shopify Files** at once, so links that expire later don't matter, and the same
   picture is never stored twice. Barcodes, codes and descriptions are kept in the site's database. Nothing is
   created in the store. Then:
@@ -39,6 +51,12 @@ Upload a supplier invoice (PDF, photo, Excel or CSV) and add the products that a
     side panel. A catalogue entry showing several colours on one row has no photos picked by default.
   - **Fill in missing photos** lists products already in the store with no photo that a catalogue covers, and
     adds copies.
+  - **Photo names and alt text.** Catalogue photos are named from the product, e.g.
+    `skull-candle-holder-blk-12cm-hn-7701.jpg` (then `-2`, `-3`), with the supplier's name and code as alt text,
+    so Content → Files is searchable. A new product's own copies are named from the shop's title
+    (`black-skull-candle-holder-12cm.jpg`); the main photo's alt text is the title, extra photos add
+    "photo 2 of 3". Copies added to existing products ("Fill in missing photos") get the same alt text and keep
+    the catalogue photo's name (Shopify doesn't allow renaming those). Photos already uploaded keep their names.
   - **Look-alike photos are stored once, automatically.** Every photo gets a visual fingerprint in the browser.
     A photo that looks the same as one already stored (resized, re-compressed, from a newer export or another
     supplier) reuses the stored one; a clearly sharper version (1.5x the pixels) replaces it everywhere instead.
@@ -46,9 +64,17 @@ Upload a supplier invoice (PDF, photo, Excel or CSV) and add the products that a
     balloons, "30th" vs "40th", or gold vs silver stay separate. Photo links, and photos stored before this
     check existed, are fingerprinted in the background from Shopify's copy when someone opens the Catalogues
     pages (this needs Shopify's image server to allow it; if it doesn't, those are simply skipped).
-  - Each upload (C1, C2, …) has its own page. Uploading a newer export from the same supplier replaces the older
-    one; **Undo this upload** stops using it at once (the older one comes back) and deletes its photos from
-    Files, except ones a newer upload also uses. Products keep their own copies.
+  - Uploads are listed in date groups (Today, Yesterday, This week, Last week, earlier this month, then by
+    month). Each upload (C1, C2, …) has its own page. Uploading a newer export from the same supplier replaces the
+    older one.
+  - **Remove catalogue** (with a confirmation) stops using it at once (an older one from the supplier comes back),
+    deletes its photos from Files (except ones another catalogue also uses) and takes it off the list.
+  - **Photos on store products are protected.** The site records which product got which catalogue photo. If
+    any product uses photos from a catalogue, removing it shows a strict warning naming those products and only
+    goes ahead once the catalogue's code is typed; those products then lose those photos too. They're listed
+    under **Fill in missing photos** ("Photos removed with C3"), first in the list as soon as another catalogue
+    has their photos, and as "waiting" until one does. Products given photos before this record existed aren't
+    covered by the warning.
 - **Settings** (profile menu → Settings, shared by everyone): turn the import/run tags on or off, and whether
   catalogue photos and descriptions are used automatically. The supplier list shows every supplier with its
   product count in the store and its catalogues; one that no store product and no active catalogue uses can be
@@ -56,6 +82,40 @@ Upload a supplier invoice (PDF, photo, Excel or CSV) and add the products that a
   `wrangler.toml` to let only those people change settings and delete suppliers; leave it empty for everyone.
 - **Undo import**: deletes the products from one import. As a safety check it only deletes a product whose
   `import_source` holds that import ID and whose price is still $0.00; anything already priced is kept.
+
+## Suppliers
+
+The supplier of an invoice or catalogue is worked out from the name the AI reads on it, the heading at the top of
+a spreadsheet, and the file name ("3 - Harbour Novelty Imports - Order HN-5521.xlsx", "toplite_catalogue.xlsx").
+If it's one of your suppliers (under any spelling: "ALPEN PTY LTD" is Alpen) it's chosen for you, with a note
+saying where it was found; change it if that's wrong. If it isn't, the name is suggested with an **Add** / **Use**
+button, and nothing is added until someone clicks it. The shop itself ("Price Savers") is never taken as the
+supplier. A catalogue can't be saved without a supplier: pressing Save without one marks the box and says so.
+
+## Long invoices and product lists
+
+Files of any length are read without splitting them:
+
+- **Excel and CSV** are read by the page itself. The AI looks at the first rows only and says which column is
+  the barcode, the code and the description; the page checks that against the data (and fixes or replaces a wrong
+  answer with its own reading, which also works with the AI down), then reads every row: barcodes and codes are
+  copied exactly, headings, section titles, totals, freight and notes are skipped (the count shows on the invoice
+  card), and the column headings repeated on each printed page are recognised. CSVs in UTF-8, UTF-16 or old
+  Windows encodings, with commas, semicolons, tabs or pipes, all work. A layout that isn't a table goes to the AI
+  in parts instead.
+- **Titles** from spreadsheets show a tidy made by simple rules straight away, then the AI tidies them 100 at a
+  time ("Tidying titles" on the invoice card). Each line goes out with an id and must come back with that id and
+  an exact copy of its own description; a title is only used if it adds no number that wasn't on the line and
+  describes its own line better than any other line in the batch, so a title can't land on the neighbouring
+  product. Lines the checks turn down are asked again in small batches; if the AI still can't do one (or isn't
+  available), the simple tidy is kept and the product is marked **Check title** and left unticked. **Tidy N
+  titles again** on the invoice card retries later. A title someone edited is never overwritten. Tidying carries
+  on after a page reload, and runs alongside reading the next file.
+- **Long PDFs** that don't fit in one AI answer are read three pages at a time (fewer if needed). The page count is
+  read from the PDF itself where possible, and the page after the last is always checked in case the count was low.
+- **A run holds up to 2,000 products.** A bigger file asks which lines to load (for example 1–2,000 or
+  2,001–4,812); add the file again in a new import for the rest. A whole product range that's only wanted for
+  photos and descriptions belongs on Catalogues, which has no limit.
 
 ## Using it
 
@@ -77,8 +137,10 @@ The Worker in `src/` handles `/api/*`.
 | Path | What it does |
 | --- | --- |
 | `GET /api/health` | Signed-in user, whether the AI and Shopify are reachable |
-| `POST /api/extract` | CSV / Excel text (Excel is converted in the browser) to rows, matched against the store |
-| `POST /api/extract-file` | PDF / photo as base64, streamed to the AI without parsing (keeps CPU low) |
+| `POST /api/invoice/map` | The first rows of a spreadsheet invoice: which column is which |
+| `POST /api/titles` | Tidies up to 100 titles, returning only the ones that pass the checks |
+| `POST /api/extract` | Text of a spreadsheet the columns couldn't be worked out for (or one part of it), read by the AI |
+| `POST /api/extract-file` | PDF / photo as base64, streamed to the AI without parsing (keeps CPU low); `X-Pages: 4-6` reads only those pages |
 | `POST /api/lookup` | Checks up to 50 edited barcodes against the store |
 | `POST /api/match` | Re-checks the whole list against the full catalogue |
 | `POST /api/create` | Creates up to 15 products, re-checking their barcodes first, with catalogue photos and descriptions |
@@ -201,3 +263,57 @@ loaded only when someone picks an Excel file. `public/vendor/fflate.min.js` is f
 
 Sample catalogues for trying it out (fictional suppliers matching the sample invoices) are in `test/fixtures/`;
 `python3 test/fixtures/make.py` rebuilds them.
+
+## Large catalogues: saving in small steps
+
+A catalogue with thousands of products is saved in many small requests, each kept inside the Cloudflare free-plan limits (photo links are sent in bounded batches, product rows are written in batched inserts). If one request fails partway, the page stops with "Saving stopped" and keeps the same upload code. Press Save again: photos, links and products already saved are recognised and not repeated, so the save carries on from where it stopped instead of starting over.
+
+## Bigger catalogue photos
+
+Supplier exports often link to thumbnails (`…/74422371_1_200x200.jpg?ft=1`). When a catalogue's photo links are
+saved, each one that looks like a thumbnail (a `_200x200` / `-150x150` size in the file name, a `_thumb` or `_small`
+word, or `?width=200` in the link) is checked for a bigger copy: first the same link without its size, then larger
+sizes (5x and 3x). The worker fetches the start of each one, reads the picture's real size from its header and uses it
+only when it is clearly bigger than the thumbnail. If nothing bigger comes back, or Shopify refuses the bigger link,
+the link as the supplier gave it is used, so no photo is lost. This is tried for every supplier, not a chosen one.
+
+- It spends one outbound request per link per attempt (at most 25 per batch, within the free plan's 50), so a rule that
+  has never worked on a host is tried on 3 links first and given up on after 8 misses.
+- Set `PHOTO_UPGRADE = "false"` in `wrangler.toml` to turn it off.
+- It only applies when links are saved. Photos already saved keep the size they were saved at.
+
+## Products that are in the store as drafts
+
+If an invoice line matches a product that already exists in Shopify as a **draft**, importing it makes the product
+**active** and puts it on **Point of Sale**, the same as a product this tool creates, whether or not the run
+updates stock. The row says "A draft in your store. It'll be made active" and is ticked for you. Stock is then added
+like for any other product when the run's stock switch is on. Only drafts are touched: an active or archived
+product is left alone, and price, title, tags and shipping settings are never changed. **Undo import** does not
+turn an activated product back into a draft.
+
+## Stock from invoice quantities
+
+Each run has an **Update stock from these invoices** switch on the review screen, under the heading. It is **on by
+default** and is remembered with the run, so turn it off for a run that shouldn't change stock (the Stock boxes
+and "Check quantity" flags disappear, and nothing is sent to Shopify's inventory). Settings only has **Stock goes
+to**, the Shopify location that receives the stock (the store's first location if you leave it).
+
+When the switch is on:
+- The quantity on each invoice line is read: by the AI for PDFs and photos, and by column for spreadsheets
+  (headings like Qty, Quantity, Qty Shipped). If an invoice has both an ordered and a supplied/shipped
+  quantity, the supplied one is used, never ordered or back-ordered.
+- Quantities are turned into single units. "3 CTN" with a pack size of 12 is 36 (the row shows "3 × 12").
+  A carton, case or pack with no known size, a missing number, or a quantity the AI couldn't place is marked
+  **Check quantity** and can't be added until staff type the number. Typing 0 leaves that product's stock alone.
+- Each row has an editable **Stock** box. New products are created with stock tracking on and that count at the
+  chosen location. Products already in the store are ticked too: **Add stock** puts the quantity on top of what
+  they have, turning tracking on (and stocking the location) if it was off.
+- The same barcode on two lines of one invoice adds up on the first line.
+- The same invoice can't add its stock twice: each invoice line claims "this invoice adds this stock to this
+  product" before Shopify is touched, so a repeat, a retry or a re-import is skipped ("Stock already added").
+  A failed attempt gives the claim back so it can be tried again.
+- **Undo import** also takes back the stock it added to products that were already in the store (the new
+  products go with their deletion). If some have sold since, their count goes lower.
+
+The Shopify app needs `read_inventory`, `write_inventory` and `read_locations` (see the scopes above). If it
+doesn't have them, the site says so instead of failing quietly.

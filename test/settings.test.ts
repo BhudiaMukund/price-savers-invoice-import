@@ -50,7 +50,7 @@ const json = async (r: Response | Promise<Response>) => (await r).json() as Prom
 
 describe("settings", () => {
   it("has sensible defaults and saves changes", async () => {
-    expect((await json(call("GET", "/api/settings"))).settings).toEqual({ importTags: true, cataloguePhotos: true, catalogueDescriptions: true });
+    expect((await json(call("GET", "/api/settings"))).settings).toEqual({ importTags: true, cataloguePhotos: true, catalogueDescriptions: true, stockLocationId: "" });
     const res = await json(call("PUT", "/api/settings", { importTags: false }));
     expect(res.settings.importTags).toBe(false);
     expect((await call("PUT", "/api/settings", { nonsense: true })).status).toBe(400);

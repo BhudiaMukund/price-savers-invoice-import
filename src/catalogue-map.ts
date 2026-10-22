@@ -8,6 +8,8 @@ import type { Env } from "./types";
 import { ExtractionError, geminiJson, modelFor } from "./extract";
 
 export interface ColumnMap {
+  /** The supplier's business name if the catalogue shows it (a heading, a logo line). */
+  supplierName: string | null;
   sheet: string | null;
   headerRow: number | null;
   columns: {
@@ -23,6 +25,8 @@ export const MAP_PROMPT = `You are looking at the first rows of a supplier's pro
 spreadsheet. Each row is shown as "Row N: A=value | B=value ...", using the spreadsheet's own column letters.
 
 Work out the layout so a program can read every product row:
+- supplierName: the business name of the supplier whose catalogue this is, if the rows show it (often in a
+  heading at the top), without "Pty Ltd" or similar. Null if it isn't shown.
 - sheet: the name of the sheet that lists the products.
 - headerRow: the row number holding the column headings, or null if there are none.
 - columns: the column LETTER for each of these, or null if the catalogue doesn't have it:
@@ -36,6 +40,7 @@ Never guess a column that isn't there.`;
 const SCHEMA = {
   type: "OBJECT",
   properties: {
+    supplierName: { type: "STRING", nullable: true },
     sheet: { type: "STRING", nullable: true },
     headerRow: { type: "INTEGER", nullable: true },
     columns: {
@@ -51,8 +56,8 @@ const SCHEMA = {
       propertyOrdering: ["barcode", "supplierCode", "title", "description", "photoLinks"],
     },
   },
-  required: ["sheet", "headerRow", "columns"],
-  propertyOrdering: ["sheet", "headerRow", "columns"],
+  required: ["supplierName", "sheet", "headerRow", "columns"],
+  propertyOrdering: ["supplierName", "sheet", "headerRow", "columns"],
 };
 
 const COL_RE = /^[A-Z]{1,3}$/;
@@ -66,7 +71,9 @@ export function cleanMap(raw: unknown): ColumnMap {
     return COL_RE.test(s) ? s : null;
   };
   const row = Number(r.headerRow);
+  const sup = typeof r.supplierName === "string" ? r.supplierName.replace(/\s+/g, " ").trim() : "";
   return {
+    supplierName: sup && !/^(null|n\/a|none|unknown|-)$/i.test(sup) ? sup.slice(0, 100) : null,
     sheet: typeof r.sheet === "string" && r.sheet.trim() ? r.sheet.trim().slice(0, 100) : null,
     headerRow: Number.isInteger(row) && row > 0 && row < 100_000 ? row : null,
     columns: {

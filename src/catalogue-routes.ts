@@ -1,7 +1,9 @@
+import { namedPhotos } from "./photo-names";
 import type { Hono } from "hono";
 import type { Env } from "./types";
 import { CatalogueStore, FILE_ID_RE, MAX_PHOTOS_PER_ITEM, type CatalogueItemIn, type CatalogueMatch, type PhotoInfo } from "./catalogue";
-import { addPhotosToProduct, createFiles, deleteFiles, fileStatuses, IMAGE_TYPES, MAX_IMAGE_BYTES, productsWithoutPhotos, uploadImage } from "./files";
+import { upgradePhotoLinks } from "./photo-upgrade";
+import { addPhotosToProduct, createFiles, deleteFiles, fileStatuses, IMAGE_TYPES, MAX_IMAGE_BYTES, productsByIds, productsWithoutPhotos, uploadImage } from "./files";
 import { mapColumns } from "./catalogue-map";
 import { ExtractionError } from "./extract";
 import { ShopifyError } from "./shopify";
@@ -141,11 +143,17 @@ export function catalogueRoutes(app: Hono<AppEnv>) {
       }
       try {
         const photo = await uploadImage(c.env, { fileName, mimeType, size, stream, alt });
-        await store.addFile({ ...photo, fingerprint, uploadId: up.id, source: fileName });
+        try {
+          await store.addFile({ ...photo, fingerprint, uploadId: up.id, source: fileName });
+        } catch (e) {
+          // It's in Shopify Files but couldn't be recorded here: remove it, so nothing is left behind unused.
+          await deleteFiles(c.env, [photo.fileId]).catch(() => {});
+          throw e;
+        }
         return c.json({ photo });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        await store.addFailedSource(up.id, fileName, msg);
+        await store.addFailedSource(up.id, fileName, msg).catch(() => {});
         return c.json({ error: msg }, 502);
       }
     } catch (e) {
@@ -176,22 +184,49 @@ export function catalogueRoutes(app: Hono<AppEnv>) {
         else if (known[fps[i]!] && known[fps[i]!]!.status !== "failed") results[i]!.photo = known[fps[i]!];
         else todo.push(i);
       });
+      // Thumbnails ("..._200x200.jpg") are swapped for a bigger version of the same picture when the server really
+      // has one. The link as given stays the record of where the photo came from, and is the fallback.
+      const bigger = c.env.PHOTO_UPGRADE === "false" ? todo.map(() => null) : await upgradePhotoLinks(todo.map((i) => links[i]!.url));
       const made = await createFiles(
         c.env,
-        todo.map((i) => ({ source: links[i]!.url, alt: links[i]!.alt, fileName: links[i]!.name || undefined })),
+        todo.map((i, k) => ({ source: bigger[k] ?? links[i]!.url, alt: links[i]!.alt, fileName: links[i]!.name || undefined })),
       );
+      // If Shopify refuses a bigger link, use the original one for that photo.
+      const refused = todo.map((_, k) => k).filter((k) => bigger[k] && !("fileId" in made[k]!));
+      if (refused.length) {
+        const again = await createFiles(
+          c.env,
+          refused.map((k) => ({ source: links[todo[k]!]!.url, alt: links[todo[k]!]!.alt, fileName: links[todo[k]!]!.name || undefined })),
+        );
+        refused.forEach((k, n) => (made[k] = again[n]!));
+      }
+      // Save everything in a couple of database calls: the new files, and the links Shopify couldn't take.
+      const toSave: Parameters<typeof store.addFile>[0][] = [];
+      const saveFor: number[] = []; // which link each file belongs to
       for (let k = 0; k < todo.length; k++) {
         const i = todo[k]!;
         const m = made[k];
         if (!m || !("fileId" in m)) {
           results[i]!.error = m?.error ?? "Shopify couldn't fetch this link.";
-          await store.addFailedSource(up.id, links[i]!.url, results[i]!.error!);
+          toSave.push({ fileId: `failed:${up.id}:${crypto.randomUUID()}`, fingerprint: null, uploadId: up.id, status: "failed", url: null, source: links[i]!.url, error: results[i]!.error! });
+          saveFor.push(-1);
           continue;
         }
-        await store.addFile({ fileId: m.fileId, fingerprint: fps[i]!, uploadId: up.id, status: m.status, url: m.url, source: links[i]!.url, error: m.error ?? null });
-        if (m.status === "failed") results[i]!.error = m.error ?? "Shopify couldn't fetch this link.";
-        else results[i]!.photo = { fileId: m.fileId, status: m.status, url: m.url };
+        toSave.push({ fileId: m.fileId, fingerprint: fps[i]!, uploadId: up.id, status: m.status, url: m.url, source: links[i]!.url, error: m.error ?? null });
+        saveFor.push(i);
       }
+      const notSaved = await store.addFiles(toSave);
+      const orphans: string[] = [];
+      saveFor.forEach((i, n) => {
+        if (i < 0) return;
+        const m = made[todo.indexOf(i)] as PhotoInfo & { error?: string };
+        if (notSaved.has(n)) {
+          orphans.push(m.fileId);
+          results[i]!.error = notSaved.get(n)!;
+        } else if (m.status === "failed") results[i]!.error = m.error ?? "Shopify couldn't fetch this link.";
+        else results[i]!.photo = { fileId: m.fileId, status: m.status, url: m.url };
+      });
+      if (orphans.length) await deleteFiles(c.env, orphans).catch(() => {});
       return c.json({ results });
     } catch (e) {
       return fail(e);
@@ -232,12 +267,29 @@ export function catalogueRoutes(app: Hono<AppEnv>) {
     }
   });
 
-  /** Undo, step 1: the upload stops matching at once. Returns how many photos are left to delete. */
+  /**
+   * Remove, step 1: the upload stops matching at once. Returns how many photos are left to delete.
+   * If products in the store use its photos, this is refused unless `confirm` is the catalogue's code
+   * (typed in by the person), because those products lose the photos too.
+   */
   app.post("/api/catalogues/:code/undo", async (c) => {
     const store = storeOf(c.env);
     if (!store) return c.json({ error: NO_DB }, 503);
+    const code = c.req.param("code");
+    const body = await c.req.json<{ confirm?: unknown }>().catch(() => null);
     try {
-      return c.json({ remaining: await store.startUndo(c.req.param("code"), c.get("user")) });
+      const impact = await store.removalImpact(code);
+      if (impact.products && String(body?.confirm ?? "").trim().toUpperCase() !== code.toUpperCase()) {
+        return c.json(
+          {
+            error: `${impact.products === 1 ? "1 product" : `${impact.products} products`} in your store ${impact.products === 1 ? "uses" : "use"} photos from ${code}. Type ${code} to remove it anyway.`,
+            code: "has_products",
+            ...impact,
+          },
+          409,
+        );
+      }
+      return c.json({ remaining: await store.startUndo(code, c.get("user")), products: impact.products });
     } catch (e) {
       return fail(e);
     }
@@ -248,12 +300,30 @@ export function catalogueRoutes(app: Hono<AppEnv>) {
     const store = storeOf(c.env);
     if (!store) return c.json({ error: NO_DB }, 503);
     try {
-      const { uploadId, fileIds } = await store.undoBatch(c.req.param("code"), L.undoBatch);
+      const code = c.req.param("code");
+      const { uploadId, fileIds } = await store.undoBatch(code, L.undoBatch);
+      // Products that got copies of these photos lose them too (this was confirmed in step 1).
+      const copies = await store.attachmentsFor(fileIds);
+      const mediaIds = copies.map((a) => a.mediaId).filter((m): m is string => !!m && FILE_ID_RE.test(m));
+      for (let i = 0; i < mediaIds.length; i += 100) await deleteFiles(c.env, mediaIds.slice(i, i + 100));
+      await store.markAttachmentsRemoved(copies.map((a) => a.id), code, c.get("user"));
       const deleted = await deleteFiles(c.env, fileIds);
       await store.markFilesDeleted(deleted);
       const remaining = await store.undoRemaining(uploadId);
       const stuck = fileIds.length - deleted.length;
       return c.json({ remaining, ...(stuck ? { error: `Shopify didn't delete ${stuck} photo${stuck === 1 ? "" : "s"}. Try again.` } : {}) });
+    } catch (e) {
+      return fail(e);
+    }
+  });
+
+  /** Remove step 3: take the (undone, photo-free) upload off the list. */
+  app.delete("/api/catalogues/:code", async (c) => {
+    const store = storeOf(c.env);
+    if (!store) return c.json({ error: NO_DB }, 503);
+    try {
+      await store.removeUpload(c.req.param("code"));
+      return c.json({ ok: true });
     } catch (e) {
       return fail(e);
     }
@@ -282,15 +352,42 @@ export function catalogueRoutes(app: Hono<AppEnv>) {
     if (!store) return c.json({ error: NO_DB }, 503);
     try {
       const products = await productsWithoutPhotos(c.env);
-      const matches = await freshMatches(c.env, store, await store.matchStoreProducts(products));
-      const found = products
-        .filter((p) => matches[p.productId]?.photos.some((ph) => ph.status === "ready"))
+      // Products whose photos were removed with a catalogue: always checked, even if they have other photos.
+      const stripped = await store.strippedProducts();
+      const strippedInfo = new Map(stripped.map((s) => [s.productId, s]));
+      const known = new Set(products.map((p) => p.productId));
+      const extra = await productsByIds(c.env, stripped.map((s) => s.productId).filter((id) => !known.has(id)));
+      const all = [...products, ...[...extra.values()].filter((p): p is NonNullable<typeof p> => !!p)];
+      const matches = await freshMatches(c.env, store, await store.matchStoreProducts(all));
+      const tag = (p: (typeof all)[number]) => {
+        const s = strippedInfo.get(p.productId);
+        return s ? { catalogue: s.catalogue, removedAt: s.removedAt } : null;
+      };
+      const found = all
+        // Photos Shopify is still processing count too (they're shown as "processing" and become ready shortly).
+        .filter((p) => matches[p.productId]?.photos.some((ph) => ph.status === "ready" || ph.status === "processing"))
+        .sort((a, b) => Number(!!strippedInfo.get(b.productId)) - Number(!!strippedInfo.get(a.productId)))
         .slice(0, 500)
-        .map((p) => ({ product: p, match: matches[p.productId]! }));
-      return c.json({ checked: products.length, found });
+        .map((p) => ({ product: p, match: matches[p.productId]!, stripped: tag(p) }));
+      // Lost their photos, and no catalogue has new ones yet: they show up here once one does.
+      const waiting = all
+        .filter((p) => strippedInfo.has(p.productId) && !found.some((f) => f.product.productId === p.productId))
+        .map((p) => ({ product: p, stripped: tag(p) }));
+      return c.json({ checked: products.length, found, waiting });
     } catch (e) {
       return fail(e);
     }
+  });
+
+  /** How many products that lost their photos a catalogue could give photos to now (for the done screen). */
+  app.get("/api/catalogue/stripped", async (c) => {
+    const store = storeOf(c.env);
+    if (!store) return c.json({ products: 0, matched: 0 });
+    const stripped = await store.strippedProducts();
+    if (!stripped.length) return c.json({ products: 0, matched: 0 });
+    const live = [...(await productsByIds(c.env, stripped.map((s) => s.productId))).values()].filter((p): p is NonNullable<typeof p> => !!p);
+    const matches = await store.matchStoreProducts(live);
+    return c.json({ products: live.length, matched: live.filter((p) => matches[p.productId]?.photos.length).length });
   });
 
   /** Give existing products copies of catalogue photos. */
@@ -316,8 +413,21 @@ export function catalogueRoutes(app: Hono<AppEnv>) {
         results.push({ productId: it.productId, ok: false, error: "No ready photos for this product." });
         continue;
       }
-      const err = await addPhotosToProduct(c.env, it.productId, photos.map((p) => ({ url: p.url!, alt: it.title })));
-      results.push(err ? { productId: it.productId, ok: false, error: err } : { productId: it.productId, ok: true, photos: photos.length });
+      const res = await addPhotosToProduct(c.env, it.productId, namedPhotos(it.title, photos.map((p) => p.url!)));
+      if (res.error) {
+        // Shopify can add the photos and still answer with an error (a timeout, a warning). Look before saying "Not added".
+        const now = await productsByIds(c.env, [it.productId]).then((m) => m.get(it.productId)).catch(() => null);
+        if (!now?.hasPhotos) {
+          results.push({ productId: it.productId, ok: false, error: res.error });
+          continue;
+        }
+        results.push({ productId: it.productId, ok: true, photos: photos.length });
+        continue;
+      }
+      await store
+        .recordAttachments(photos.map((p, k) => ({ productId: it.productId, title: it.title, mediaId: res.mediaIds[k] ?? null, fileId: p.fileId, source: "fill" as const })), c.get("user"))
+        .catch((e) => console.error("record attachments", e));
+      results.push({ productId: it.productId, ok: true, photos: photos.length });
     }
     return c.json({ results });
   });
@@ -326,14 +436,18 @@ export function catalogueRoutes(app: Hono<AppEnv>) {
 
   app.get("/api/catalogue/signatures", async (c) => {
     const store = storeOf(c.env);
-    if (!store) return c.json({ files: [], missing: 0 });
-    return c.json({ files: await store.signatures(), missing: await store.countMissingSignatures() });
+    if (!store) return c.json({ files: [], next: null, missing: 0 });
+    const after = Math.max(0, Number(c.req.query("after")) || 0);
+    const page = await store.signatures(after, L.signaturePage);
+    return c.json({ ...page, missing: after ? 0 : await store.countMissingSignatures() });
   });
 
   app.get("/api/catalogue/signatures/missing", async (c) => {
     const store = storeOf(c.env);
     if (!store) return c.json({ files: [] });
-    return c.json({ files: await store.missingSignatures(L.signatureBatch) });
+    const files = await store.missingSignatures(L.signatureBatch);
+    const siblings = await store.siblingsOf(files.map((f) => f.fileId));
+    return c.json({ files: files.map((f) => ({ ...f, siblings: (siblings[f.fileId] ?? []).slice(0, 20) })) });
   });
 
   app.post("/api/catalogue/signatures", async (c) => {

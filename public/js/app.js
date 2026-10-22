@@ -6,6 +6,10 @@ import { findExisting, makeImportId, matchSupplier } from "./suppliers.js";
 import { createCatalogues, thumb } from "./catalogues.js";
 import { sameSupplier, supplierPicker } from "./supplier-picker.js";
 import { createSettings } from "./settings.js";
+import { createReader, MAX_ROWS_PER_RUN, titleKey } from "./invoice-reader.js";
+import { topText } from "./sheet-read.js";
+import { detectSupplier } from "./supplier-detect.js";
+import { resolveQuantity } from "./quantity.js";
 
 /* =============================================================== state */
 
@@ -26,9 +30,11 @@ const state = {
   health: null,
   store: null, // { variants, checkedAt }
   creating: null, // { done, total }
+  stock: true, // this run adds the invoice quantities to stock (switch on the review screen)
   sessionExpired: false,
   drawer: null, // { id, fix: string[] | null }
   queue: Promise.resolve(),
+  tidyQueue: Promise.resolve(), // title tidying, one invoice at a time, alongside reading
 };
 
 let seq = 0;
@@ -41,6 +47,9 @@ function makeRow(fields) {
     title: "",
     aiTitle: "", // the AI's tidied title, so staff can switch back to it
     invoiceTitle: "", // the wording printed on the invoice
+    ruleTitle: "", // spreadsheets: the title tidied by simple rules, shown until the AI's tidy arrives
+    titlePending: false, // spreadsheets: the AI is still tidying this title
+    titleNote: "", // "rules": the AI couldn't tidy it, so the simple tidy was kept; staff check it
     supplierCode: "",
     barcode: "",
     barcodeNote: "",
@@ -53,6 +62,10 @@ function makeRow(fields) {
     photos: [], // catalogue photo file IDs to use, main photo first
     photosTouched: false, // staff changed the photo choice by hand
     useDescription: true,
+    qty: null, // whole units of stock this line adds (when "Update stock from invoices" is on), or null if not known
+    qtyNote: "", // how the quantity was worked out ("6 × 12"), or why it needs a look
+    qtyCheck: false, // the quantity needs checking before the line is added
+    stockResult: null, // { status: "added", qty } | { status: "failed", error }
     catKey: "", // what the catalogue was last checked for (barcode | code | supplier)
     ...fields,
   };
@@ -106,6 +119,21 @@ function firstIdsByKey() {
   return map;
 }
 
+/** Is "Update stock from these invoices" on for this run? On by default; staff can turn it off per run. */
+const stockOn = () => state.stock;
+
+/** A line whose product is already in the store can still be selected, to add its invoice quantity to the stock. */
+function stockable(row) {
+  return stockOn() && !!row.inStore && row.qty > 0 && !row.qtyCheck && row.stockResult?.status !== "added";
+}
+
+/** In the store as a draft: it's made active (and put on Point of Sale) when its line is imported, like any other product. */
+const needsActivation = (row) => row.inStore?.status === "DRAFT" && !row.activated;
+
+function isSelectable(row, status) {
+  return SELECTABLE.has(status) || (status === "exists" && (stockable(row) || needsActivation(row)));
+}
+
 function statusOf(row, firstIds) {
   if (row.result?.status === "created") return "added";
   if (row.adding) return "adding";
@@ -113,8 +141,11 @@ function statusOf(row, firstIds) {
   if (bc.status === "invalid_check_digit" || bc.status === "invalid_format") return "invalid";
   if (row.inStore) return "exists";
   if (bc.key && firstIds.get(bc.key) !== row.id) return "duplicate";
+  if (row.titlePending) return "tidying";
   if (!row.title.trim()) return "notitle";
   if (row.result?.status === "failed") return "failed";
+  if (row.titleNote) return "checktitle";
+  if (stockOn() && row.qtyCheck) return "checkqty";
   if (bc.key && row.checked === false) return "checking";
   if (bc.key && row.checked === "error") return "unchecked";
   if (bc.status === "missing") return "missing";
@@ -127,6 +158,9 @@ const GROUP = {
   missing: "attention",
   invalid: "attention",
   notitle: "attention",
+  tidying: "new",
+  checktitle: "attention",
+  checkqty: "attention",
   failed: "attention",
   checking: "attention",
   unchecked: "attention",
@@ -134,7 +168,7 @@ const GROUP = {
   duplicate: "store",
   added: "added",
 };
-const SELECTABLE = new Set(["ready", "missing", "failed", "unchecked"]);
+const SELECTABLE = new Set(["ready", "missing", "failed", "unchecked", "checktitle"]);
 
 const BADGE = {
   ready: ["badge-new", "New"],
@@ -144,6 +178,9 @@ const BADGE = {
   duplicate: ["", "Duplicate"],
   invalid: ["badge-bad", "Check barcode"],
   notitle: ["badge-bad", "Needs a title"],
+  tidying: ["badge-busy", "Tidying title"],
+  checktitle: ["badge-warn", "Check title"],
+  checkqty: ["badge-warn", "Check quantity"],
   failed: ["badge-bad", "Not added"],
   checking: ["badge-busy", "Checking"],
   unchecked: ["badge-warn", "Not checked"],
@@ -164,9 +201,32 @@ function badge(status) {
   return b;
 }
 
+/**
+ * The same barcode on two lines of one invoice is one product, so their quantities add up on the first line.
+ * Maps that first line's row id to the extra units from its duplicates (rebuilt with every snapshot).
+ */
+let stockExtra = new Map();
+function duplicateQuantities(status) {
+  const out = new Map();
+  if (!stockOn()) return out;
+  const first = new Map();
+  for (const r of state.rows) {
+    const k = analyzeBarcode(r.barcode).key;
+    if (k && status.get(r.id) !== "duplicate" && !first.has(`${r.sourceId}|${k}`)) first.set(`${r.sourceId}|${k}`, r.id);
+  }
+  for (const r of state.rows) {
+    const k = analyzeBarcode(r.barcode).key;
+    if (!k || status.get(r.id) !== "duplicate" || !(r.qty > 0) || r.qtyCheck) continue;
+    const to = first.get(`${r.sourceId}|${k}`);
+    if (to) out.set(to, (out.get(to) ?? 0) + r.qty);
+  }
+  return out;
+}
+
 function snapshot() {
   const firstIds = firstIdsByKey();
   const status = new Map(state.rows.map((r) => [r.id, statusOf(r, firstIds)]));
+  stockExtra = duplicateQuantities(status);
   const counts = { all: state.rows.length, new: 0, attention: 0, store: 0, added: 0 };
   for (const s of status.values()) counts[GROUP[s]]++;
   return { status, counts };
@@ -288,17 +348,19 @@ function paintSupplierHint(li, src) {
   const name = (src.supplier ?? "").trim();
   if (src.supplierSaving) bits.push("Saving the new supplier…");
   else if (supplierLocked(src)) bits.push("Set on the products already added.");
-  else if (!name && src.supplierFromInvoice) {
+  else if (!name && (src.supplierSuggestion ?? src.supplierFromInvoice)) {
+    const sug = src.supplierSuggestion || src.supplierFromInvoice;
+    const where = { invoice: "The invoice says", sheet: "The spreadsheet says", file: "The file name suggests" }[src.supplierFrom] ?? "The invoice says";
     bits.push(
-      `The invoice says “${src.supplierFromInvoice}”, which isn't one of your suppliers. Pick one from the list, or `,
-      h("button", { type: "button", class: "link", onclick: () => commitSupplier(src, src.supplierFromInvoice) }, "add it as a new supplier"),
-      ".",
+      `${where} “${sug}”, which isn't one of your suppliers yet. `,
+      h("button", { type: "button", class: "link", onclick: () => commitSupplier(src, sug) }, `Add “${sug}”`),
+      " or pick one from the list.",
     );
     hint.classList.add("is-warn");
   } else if (!name && (src.state === "done" || src.kind === "manual")) {
     bits.push("Choose a supplier before adding.");
     hint.classList.add("is-warn");
-  } else if (name && src.supplierAuto) bits.push("Matched from the invoice.");
+  } else if (name && src.supplierAuto) bits.push({ sheet: "Matched from the spreadsheet.", file: "Matched from the file name." }[src.supplierFrom] ?? "Matched from the invoice.");
   if (src.invoiceNumber) bits.push(h("span", { class: "sup-inv" }, `Invoice ${src.invoiceNumber}`));
   hint.replaceChildren(...bits);
 }
@@ -330,6 +392,15 @@ function paintSourceCard(li, src, snap) {
     h("span", { class: "source-name" }, src.name),
     h("span", { class: "source-meta" }, meta),
   ];
+  if (src.tidy && src.state === "done") {
+    kids.push(
+      h(
+        "span",
+        { class: "source-meta source-tidy" },
+        src.tidy.wait ? `AI busy. Tidying titles again in ${src.tidy.wait}s…` : `Tidying titles: ${fmt(src.tidy.done)} of ${fmt(src.tidy.total)}`,
+      ),
+    );
+  } else if (src.note && src.state === "done") kids.push(h("span", { class: "source-meta source-note", title: "Lines with no product on them: section headings, totals, freight and notes" }, src.note));
   if (src.state === "reading" || src.state === "queued") kids.push(h("span", { class: "source-bar" }, h("span")));
   else if (rows.length) {
     const bar = h("span", { class: "source-bar", "aria-hidden": "true" });
@@ -349,7 +420,10 @@ function paintSourceCard(li, src, snap) {
 
   // Supplier, invoice number, import ID, undo
   const extra = $(".source-extra", li);
-  extra.hidden = src.state === "failed" && !rows.length;
+  // A file that couldn't be read: only its "Try again" button, no supplier box.
+  const failedEmpty = src.state === "failed" && !rows.length;
+  extra.hidden = failedEmpty && !fileFor.has(src.id);
+  for (const el of extra.querySelectorAll(".sup-label, .sp, .sup-hint")) el.hidden = failedEmpty;
   const input = $(".sup-input", li);
   li._picker.setValue(src.supplier ?? "");
   li._picker.setDisabled(supplierLocked(src) || !!state.creating);
@@ -371,6 +445,25 @@ function paintSourceCard(li, src, snap) {
         },
         h("span", { class: "import-id-label" }, "Import ID"),
         h("span", { class: "mono" }, src.importId),
+      ),
+    );
+  }
+  if (src.state === "failed" && fileFor.has(src.id) && !rows.length) {
+    acts.push(h("button", { type: "button", class: "btn btn-sm btn-secondary", onclick: () => retrySource(src) }, icon("refresh", 14), "Try again"));
+  }
+  const untidy = rows.filter((r) => r.titleNote && r.title === r.ruleTitle && r.result?.status !== "created").length;
+  if (untidy && !src.tidy) {
+    acts.push(
+      h(
+        "button",
+        {
+          type: "button",
+          class: "btn btn-sm btn-ghost",
+          title: "Ask the AI again to tidy the titles it couldn't tidy before",
+          disabled: !!state.creating,
+          onclick: () => retryTidy(src),
+        },
+        `Tidy ${plural(untidy, "title")} again`,
       ),
     );
   }
@@ -410,9 +503,12 @@ function renderSupplierOptions() {
   // The supplier pickers read state.suppliers directly each time they open.
 }
 
+/** A product already in the store that this invoice added stock to (and that hasn't been taken back). */
+const stockedRow = (r) => r.result?.status !== "created" && r.stockResult?.status === "added" && r.stockResult.qty > 0;
+
 /** Products from this invoice that are in Shopify: what this page knows, or what the server's ledger says. */
 function liveCount(src) {
-  const here = sourceRows(src).filter((r) => r.result?.status === "created").length;
+  const here = sourceRows(src).filter((r) => r.result?.status === "created" || stockedRow(r)).length;
   return Math.max(here, state.run?.liveByInvoice?.[src.id] ?? 0);
 }
 
@@ -455,6 +551,8 @@ async function removeSource(src) {
             const order = new Map(state.sources.map((s, i) => [s.id, i]));
             state.rows.sort((a, b) => (order.get(a.sourceId) ?? 0) - (order.get(b.sourceId) ?? 0));
             render();
+            // Titles that were still being tidied when it was removed: carry on.
+            if (rows.some((r) => r.titlePending)) state.tidyQueue = state.tidyQueue.then(() => tidySource(src));
           },
         ],
   });
@@ -495,9 +593,10 @@ async function loadSuppliers() {
     state.suppliers = res.suppliers;
     // Invoices read before the list arrived: try matching again.
     for (const src of state.sources) {
-      if (!src.supplier && src.supplierFromInvoice) {
-        const m = matchSupplier(src.supplierFromInvoice, state.suppliers);
-        if (m) Object.assign(src, { supplier: m, supplierAuto: true });
+      if (!src.supplier && src.kind !== "manual" && src.state === "done") {
+        const det = detectSupplier({ aiName: src.supplierFromInvoice ?? "", fileNames: [src.name], suppliers: state.suppliers });
+        if (det.match) Object.assign(src, { supplier: det.match, supplierAuto: true, supplierFrom: det.from });
+        else if (det.suggestion && !src.supplierSuggestion) Object.assign(src, { supplierSuggestion: det.suggestion, supplierFrom: det.from });
       }
     }
     render();
@@ -516,9 +615,24 @@ async function copyText(text, done) {
   }
 }
 
-function renderHead() {
+function renderHead(snap) {
+  const toggle = $("#stock-toggle");
+  toggle.checked = state.stock;
+  toggle.disabled = !!state.creating;
+  $("#stock-hint").textContent = state.stock
+    ? "Each line's quantity is added to the product's stock in Shopify. Check the Stock boxes below."
+    : "Stock in Shopify won't change for this run.";
   const sub = $("#review-sub");
   const reading = state.sources.some((s) => s.state === "reading" || s.state === "queued");
+  // Products still being checked against the store or having titles tidied are not sorted yet, so the
+  // New / Needs a look counts keep changing. Say so, or staff may stop at the first numbers they see.
+  let working = 0;
+  if (snap) for (const st of snap.status.values()) if (st === "checking" || st === "tidying") working++;
+  sub.classList.toggle("is-busy", working > 0);
+  if (working > 0) {
+    sub.textContent = `Still working on ${fmt(working)} of ${fmt(state.rows.length)} products: checking your store and tidying titles. The counts below will change, so wait for this message to go before you finish.`;
+    return;
+  }
   if (reading && !state.rows.length) sub.textContent = "Reading your invoice. Products appear here as soon as it's done.";
   else if (state.store) sub.textContent = `Checked against ${plural(state.store.variants, "product")} in your Shopify store at ${timeOf(state.store.checkedAt)}.`;
   else sub.textContent = "Products added by hand are checked against your store by barcode.";
@@ -567,14 +681,58 @@ function itemNote(row, status) {
   const bc = analyzeBarcode(row.barcode);
   if (status === "invalid") return bc.status === "invalid_check_digit" ? "A digit looks misread" : "Not a valid barcode";
   if (status === "failed") return row.result.error;
+  if (status === "checkqty") return row.qtyNote || "Check the quantity";
+  if (status === "duplicate" && stockOn() && row.qty > 0 && !row.qtyCheck) return `${fmt(row.qty)} added to the first line`;
+  if (row.stockResult?.status === "failed") return `Stock not added: ${row.stockResult.error}`;
+  if (row.activateError) return `Couldn't make it active: ${row.activateError}`;
+  if (row.activated) return "Was a draft. Now active";
+  if (status === "exists" && needsActivation(row)) return "A draft in your store. It'll be made active";
   if (status === "exists" && row.inStore.title.trim().toLowerCase() !== row.title.trim().toLowerCase()) return `As “${row.inStore.title}”`;
   if (row.barcodeNote && status === "ready") return "Leading zero restored";
   return null;
 }
 
+/** The stock this line adds, editable in the row: "Stock + [12]". Only when stock updates are on. */
+function qtyControl(row, status) {
+  if (!stockOn()) return null;
+  if (row.stockResult?.status === "added") {
+    return h("span", { class: "qty-done", title: row.stockResult.already ? "This invoice had already added this stock" : "Added to the product's stock in Shopify" }, row.stockResult.already ? "Stock already added" : `Stock +${fmt(row.stockResult.qty)} added`);
+  }
+  if (row.result?.status === "created" || ["duplicate", "invalid", "adding", "added"].includes(status)) return null;
+  const input = h("input", {
+    type: "number",
+    min: "0",
+    step: "1",
+    inputmode: "numeric",
+    class: `qty-input${row.qtyCheck ? " is-check" : ""}`,
+    placeholder: "0",
+    value: row.qty ?? "",
+    "aria-label": `Stock to add for ${row.title.trim() || "this product"}`,
+    disabled: !!state.creating,
+  });
+  for (const ev of ["click", "keydown", "dblclick"]) input.addEventListener(ev, (e) => e.stopPropagation());
+  input.addEventListener("change", () => {
+    const v = input.value.trim();
+    const n = v === "" ? null : Math.max(0, Math.floor(Number(v)));
+    row.qty = Number.isFinite(n) ? n : null;
+    row.qtyCheck = row.qty === null; // typing a number (0 means "don't change the stock") settles it
+    row.qtyNote = row.qty === null ? "Enter a quantity, or 0 to leave the stock alone" : "";
+    if (row.inStore && row.stockResult?.status !== "added") row.selected = stockable(row) || needsActivation(row);
+    render();
+  });
+  const more = stockExtra.get(row.id);
+  return h(
+    "label",
+    { class: `qty-wrap${row.qtyCheck ? " is-check" : ""}`, title: row.qtyNote || "Units added to the product's stock. 0 leaves the stock alone." },
+    row.inStore ? "Add stock" : "Stock",
+    input,
+    more ? h("span", {}, `+ ${fmt(more)} from a repeat line`) : null,
+  );
+}
+
 function renderItem(row, status, sourceName) {
   const bc = analyzeBarcode(row.barcode);
-  const selectable = SELECTABLE.has(status) && !state.creating;
+  const selectable = isSelectable(row, status) && !state.creating;
   const selected = selectable && row.selected;
   const title = row.title.trim();
 
@@ -595,6 +753,7 @@ function renderItem(row, status, sourceName) {
     row.supplierCode ? h("span", { class: "mono" }, row.supplierCode) : null,
     row.barcode ? h("span", { class: "item-meta-bar mono" }, row.barcode) : null,
     sourceName ? h("span", {}, sourceName) : null,
+    qtyControl(row, status),
   );
 
   const barCell = h("div", { class: `item-bar${status === "invalid" ? " is-bad" : ""}`, role: "gridcell" });
@@ -687,7 +846,7 @@ function renderList(snap) {
     empty.replaceChildren(h("strong", {}, t), d);
   }
 
-  const selectable = rows.filter((r) => SELECTABLE.has(snap.status.get(r.id)));
+  const selectable = rows.filter((r) => isSelectable(r, snap.status.get(r.id)));
   const all = $("#select-all");
   const on = selectable.filter((r) => r.selected).length;
   all.disabled = !selectable.length || !!state.creating;
@@ -696,7 +855,7 @@ function renderList(snap) {
 }
 
 function chosenRows(snap) {
-  return state.rows.filter((r) => r.selected && SELECTABLE.has(snap.status.get(r.id)));
+  return state.rows.filter((r) => r.selected && isSelectable(r, snap.status.get(r.id)));
 }
 
 function renderActionBar(snap) {
@@ -719,10 +878,16 @@ function renderActionBar(snap) {
     const missing = sourcesMissingSupplier(chosen);
     count.replaceChildren(
       `${fmt(chosen.length)} selected`,
-      h("small", {}, missing.length ? `Choose a supplier for ${missing[0].name}${missing.length > 1 ? ` and ${missing.length - 1} more` : ""}` : "Added at $0, in-store only"),
+      h("small", {}, missing.length ? `Choose a supplier for ${missing[0].name}${missing.length > 1 ? ` and ${missing.length - 1} more` : ""}` : stockOn() ? "New products at $0, in-store only, with stock counted" : "Added at $0, in-store only"),
     );
     btn.disabled = !state.health?.shopify || state.sessionExpired;
-    btn.textContent = missing.length ? "Choose supplier" : `Add ${chosen.length === 1 ? "1 product" : `${fmt(chosen.length)} products`}`;
+    const existing = chosen.filter((r) => snap.status.get(r.id) === "exists");
+    const fresh = chosen.length - existing.length;
+    const drafts = existing.filter(needsActivation).length;
+    const stocked = existing.filter(stockable).length;
+    const parts = [fresh ? `add ${plural(fresh, "product")}` : "", drafts ? `activate ${plural(drafts, "draft")}` : "", stocked ? `add stock to ${plural(stocked, "product")}` : ""].filter(Boolean);
+    const label = parts.join(", ").replace(/^./, (c) => c.toUpperCase());
+    btn.textContent = missing.length ? "Choose supplier" : label;
     $("#ab-clear").hidden = false;
     $("#ab-progress").hidden = true;
   }
@@ -739,7 +904,8 @@ function sourcesMissingSupplier(rows) {
 function rowPhotos(row) {
   if (!row.catalogue || !row.photos?.length) return [];
   const byId = new Map(row.catalogue.photos.map((p) => [p.fileId, p]));
-  return row.photos.map((id) => byId.get(id)).filter((p) => p && p.status === "ready" && p.url);
+  // A short-form entry (run just reopened) has no links yet; its ready photos still count.
+  return row.photos.map((id) => byId.get(id)).filter((p) => p && p.status === "ready" && (p.url || row.catalogue.slim));
 }
 
 function catKeyOf(row) {
@@ -832,6 +998,14 @@ function paintDrawerPhotos(row, lock) {
   const m = row.catalogue;
   box.hidden = !m;
   if (!m) return;
+  if (m.slim) {
+    // Saved in short form: the full entry is being looked up again.
+    $("#dr-photos-label").textContent = "Supplier catalogue";
+    $("#dr-photos-note").className = "dr-photos-note";
+    $("#dr-photos-note").replaceChildren(`From the ${m.supplier} catalogue. Loading its photos…`);
+    $("#dr-photo-strip").replaceChildren();
+    return;
+  }
   const used = rowPhotos(row).length;
   $("#dr-photos-label").textContent = m.photos.length ? `Photos (${used} of ${m.photos.length} used)` : "Supplier catalogue";
   const note = $("#dr-photos-note");
@@ -942,12 +1116,31 @@ function paintDrawer(snap) {
     duplicate: "Another product in this list has the same barcode. Only the first one can be added.",
     invalid: "This barcode doesn't add up. Check it against the invoice, scan the product, or clear it.",
     notitle: "Give this product a title so staff can find it.",
+    tidying: "The title is being tidied. It can be added once that's done.",
+    checktitle: "The AI couldn't tidy this title reliably, so it was tidied by simple rules. Check it reads well, change it if needed, then add it.",
     failed: `Shopify didn't accept it: ${row.result?.error ?? "unknown error"}`,
     checking: "Checking your store for this barcode…",
     unchecked: "Couldn't check your store for this barcode. It'll be checked again when you add it.",
     missing: "No barcode on the invoice. Scan or type one so it can be sold at the till, or add it without.",
   }[status];
-  $("#dr-status").replaceChildren(badge(status), h("p", { class: "dr-status-msg" }, msg));
+  $("#dr-status").replaceChildren(
+    badge(status),
+    h("p", { class: "dr-status-msg" }, msg),
+    status === "checktitle" && !lock
+      ? h(
+          "button",
+          {
+            type: "button",
+            class: "link dr-status-act",
+            onclick: () => {
+              clearTitleNote(row, true);
+              render();
+            },
+          },
+          "The title is fine",
+        )
+      : null,
+  );
 
   // Fields
   for (const sel of ["#dr-name", "#dr-barcode", "#dr-code"]) $(sel).readOnly = lock;
@@ -980,6 +1173,7 @@ function paintDrawer(snap) {
                 class: "link alt-use",
                 onclick: () => {
                   row.title = text;
+                  clearTitleNote(row);
                   $("#dr-name").value = text;
                   if (row.result?.status === "failed") row.result = null;
                   render();
@@ -1025,7 +1219,13 @@ function paintDrawer(snap) {
   switch (status) {
     case "exists":
       sc.classList.add("is-in");
-      scBody = [h("strong", {}, "Already in your store"), `As “${row.inStore.title}”.`, h("br"), link(row.inStore.productId, "Open in Shopify")];
+      scBody = [
+        h("strong", {}, "Already in your store"),
+        `As “${row.inStore.title}”.`,
+        needsActivation(row) ? " It's a draft, so it will be made active and put on Point of Sale." : row.activated ? " It was a draft and is now active." : null,
+        h("br"),
+        link(row.inStore.productId, "Open in Shopify"),
+      ].filter(Boolean);
       break;
     case "added":
       sc.classList.add("is-ok");
@@ -1066,7 +1266,7 @@ function paintDrawer(snap) {
 
   // Include toggle
   const inc = $("#dr-include");
-  const selectable = SELECTABLE.has(status) && !state.creating;
+  const selectable = isSelectable(row, status) && !state.creating;
   inc.disabled = !selectable;
   inc.checked = selectable && row.selected;
 
@@ -1176,6 +1376,7 @@ function wireDrawer() {
     const row = drawerRow();
     if (!row) return;
     row.title = e.target.value.replace(/\s*\n\s*/g, " ");
+    clearTitleNote(row); // staff have looked at it
     if (row.result?.status === "failed") row.result = null;
     scheduleRender();
   });
@@ -1299,12 +1500,62 @@ let saving = false;
 let lastSaved = ""; // JSON last stored on the server, to skip saves when nothing changed
 let pending = "";
 
+/*
+ * Rows as saved, kept small so a run of 2,000 products fits the server's limit: fields still at their starting
+ * value are left out (makeRow puts them back), titles equal to the shown title are flagged instead of repeated,
+ * file IDs are shortened, and catalogue matches keep only what the list shows until they're looked up again.
+ */
+const ROW_DEFAULTS = makeRow({});
+const packId = (id) => String(id).replace(/^gid:\/\/shopify\/MediaImage\//, "M").replace(/^gid:\/\/shopify\/GenericFile\//, "G");
+const unpackId = (id) => String(id).replace(/^M(?=\d)/, "gid://shopify/MediaImage/").replace(/^G(?=\d)/, "gid://shopify/GenericFile/");
+
+function compactRow(r) {
+  const out = { id: r.id, sourceId: r.sourceId };
+  for (const [k, v] of Object.entries(r)) {
+    if (k === "id" || k === "sourceId" || k === "adding") continue;
+    const d = ROW_DEFAULTS[k];
+    if (v === d || (Array.isArray(v) && Array.isArray(d) && !v.length && !d.length)) continue;
+    out[k] = v;
+  }
+  let same = 0;
+  if (r.title && r.aiTitle === r.title) (same |= 1), delete out.aiTitle;
+  if (r.title && r.ruleTitle === r.title) (same |= 2), delete out.ruleTitle;
+  if (same) out.same = same;
+  if (r.photos?.length) out.photos = r.photos.map(packId);
+  if (r.catalogue) {
+    const c = r.catalogue;
+    out.catalogue = { slim: true, itemId: c.itemId, supplier: c.supplier, by: c.by, mixed: c.mixed, photos: (c.photos ?? []).map((p) => `${packId(p.fileId)}|${p.status}`) };
+  }
+  return out;
+}
+
+/** A saved row back to its full form (the opposite of compactRow). Older saves pass through unchanged. */
+function expandRow(r) {
+  const out = { ...r };
+  if (r.same & 1) out.aiTitle = r.title;
+  if (r.same & 2) out.ruleTitle = r.title;
+  delete out.same;
+  if (Array.isArray(r.photos)) out.photos = r.photos.map(unpackId);
+  if (r.catalogue?.slim) {
+    out.catalogue = {
+      ...r.catalogue,
+      photos: (r.catalogue.photos ?? []).map((p) => {
+        if (typeof p !== "string") return p;
+        const [id, status] = p.split("|");
+        return { fileId: unpackId(id), status };
+      }),
+    };
+  }
+  return out;
+}
+
 /** What gets saved: invoices and products, without in-flight details. */
 function runDataJson() {
   return JSON.stringify({
-    sources: state.sources.map(({ cancelled, supplierSaving, ...s }) => s),
-    rows: state.rows.map((r) => ({ ...r, adding: false })),
+    sources: state.sources.map(({ cancelled, supplierSaving, tidy, ...s }) => s),
+    rows: state.rows.map(compactRow),
     store: state.store,
+    stock: state.stock,
   });
 }
 
@@ -1343,6 +1594,9 @@ async function flushSave({ keepalive = false } = {}) {
         id: "conflict",
         action: ["Reload", () => location.reload()],
       });
+    } else if (err instanceof ApiError && err.status === 413) {
+      setSaveState("toobig");
+      toast("bad", `${err.message} Your latest changes aren't saved. Remove an invoice from this run, or add more invoices in a new import.`, { sticky: true, id: "save-too-big" });
     } else if (err instanceof ApiError && err.body?.code === "invoice_has_products") {
       toast("bad", err.message, { sticky: true, id: "save-refused" });
       setSaveState("error");
@@ -1362,7 +1616,7 @@ function setSaveState(s) {
   const el = $("#save-state");
   if (!el) return;
   el.dataset.state = s;
-  el.textContent = { saved: "Saved", saving: "Saving…", error: "Not saved yet, retrying", conflict: "Not saved, changed elsewhere" }[s];
+  el.textContent = { saved: "Saved", saving: "Saving…", error: "Not saved yet, retrying", conflict: "Not saved, changed elsewhere", toobig: "Not saved: run too big" }[s];
 }
 
 addEventListener("pagehide", () => flushSave({ keepalive: true }));
@@ -1381,6 +1635,7 @@ function resetAll() {
   state.sourceFilter = null;
   state.query = "";
   state.store = null;
+  state.stock = true;
   $("#search").value = "";
   lastSaved = pending = "";
 }
@@ -1464,20 +1719,22 @@ async function openRun(code, { quiet = false } = {}) {
     const data = run.data ?? {};
     resetAll();
     state.run = { ...run, data: undefined };
-    state.sources = (data.sources ?? []).map((s) =>
-      // A file that was mid-read when the run was last saved can't continue.
+    state.sources = (data.sources ?? []).map(({ tidy, ...s }) =>
+      // A file that was mid-read when the run was last saved can't continue. (Title tidying carries on.)
       s.state === "reading" || s.state === "queued" ? { ...s, state: "failed", message: "Interrupted. Add this file again." } : s,
     );
-    state.rows = (data.rows ?? []).map((r) => makeRow({ ...r, adding: false }));
-    // Photos Shopify was still processing when this run was saved: look them up again.
-    for (const r of state.rows) if (r.catalogue?.photos?.some((p) => p.status === "processing")) r.catKey = "";
+    state.rows = (data.rows ?? []).map((r) => makeRow({ ...expandRow(r), adding: false }));
+    // Catalogue matches are saved in short form, and photos may have finished processing: look them up again.
+    for (const r of state.rows) if (r.catalogue?.slim || r.catalogue?.photos?.some((p) => p.status === "processing")) r.catKey = "";
     state.store = data.store ?? null;
+    state.stock = data.stock !== false;
     state.view = "run";
     lastSaved = runDataJson();
     pending = "";
     setSaveState("saved");
     render();
     if (state.rows.some((r) => r.checked === false)) scheduleLookup();
+    resumeTidying();
   } catch (err) {
     if (err instanceof SessionExpired) return sessionExpired();
     toast("bad", err instanceof ApiError && err.status === 404 ? `Run ${code} wasn't found.` : `Couldn't open run ${code}. ${errorText(err)}`);
@@ -1670,10 +1927,47 @@ async function addFiles(list) {
     const src = { id: uid("s"), name: file.name, kind: kindOf(file.name), state: "queued", message: "", supplier: "" };
     state.sources.push(src);
     // One at a time: stays inside the AI's free per-minute limit and keeps invoice order.
+    fileFor.set(src.id, file); // kept while the page is open, so a failed read can be tried again
     state.queue = state.queue.then(() => readInvoice(file, src));
   }
   if (state.filter === "added" || state.filter === "store") state.filter = "all";
   render();
+}
+
+const reader = createReader({ api, ApiError, SessionExpired });
+
+/** A row's fields from a line the server read and matched. */
+/** Quantity fields from what the AI or the spreadsheet read (see quantity.js). */
+function stockFields(r) {
+  const q = resolveQuantity({ quantity: r.quantity, unit: r.unit ?? "", unitsPer: r.unitsPer ?? null, unclear: r.qtyUnclear === true });
+  return { qty: q.qty, qtyNote: q.note, qtyCheck: q.check };
+}
+
+function serverRowFields(r) {
+  const stock = stockFields(r);
+  return {
+    ...stock,
+    title: r.title ?? "",
+    aiTitle: r.invoiceTitle ? r.title : "",
+    invoiceTitle: r.invoiceTitle ?? "",
+    supplierCode: r.supplierCode ?? "",
+    barcode: r.barcodeRepaired && r.barcode ? analyzeBarcode(r.barcode).digits : (r.barcode ?? ""),
+    barcodeNote: r.barcodeRepaired ? `The invoice said ${r.barcode}. Leading zero restored.` : "",
+    inStore: r.match === "exists" ? r.existing : null,
+    selected: (r.match === "new" && r.barcodeStatus === "valid") || (r.match === "exists" && ((stockOn() && stock.qty > 0 && !stock.qtyCheck) || r.existing?.status === "DRAFT")),
+  };
+}
+
+/** Files picked in this visit, by invoice, for "Try again". (Not saved: after a reload, the file is added again.) */
+const fileFor = new Map();
+
+function retrySource(src) {
+  const file = fileFor.get(src.id);
+  if (!file) return toast("info", `Add ${src.name} again to read it.`);
+  state.rows = state.rows.filter((r) => r.sourceId !== src.id);
+  Object.assign(src, { state: "queued", message: "", cancelled: false });
+  render();
+  state.queue = state.queue.then(() => readInvoice(file, src));
 }
 
 async function readInvoice(file, src) {
@@ -1682,63 +1976,55 @@ async function readInvoice(file, src) {
     Object.assign(src, { state: "failed", message: "Not read. Sign in again first." });
     return render();
   }
+  const opts = {
+    isCancelled: () => !!src.cancelled,
+    onStatus: (m) => {
+      src.message = m;
+      render();
+    },
+    onWait: (secs, n, of) => {
+      src.message = `The AI is busy. Trying again in ${secs}s (try ${n} of ${of})…`;
+      render();
+    },
+  };
+  let out = null;
   try {
     Object.assign(src, { state: "reading", message: "Preparing the file…" });
     render();
     const prepared = await prepare(file);
     if (src.cancelled) return;
-    src.message = "Reading the invoice…";
-    render();
-    // Google's free tier is sometimes overloaded. Try up to 3 times; from the 2nd try the server
-    // switches to the backup model, which usually has room.
-    const WAITS = [0, 4000, 10000];
-    let res;
-    for (let attempt = 1; attempt <= WAITS.length; attempt++) {
-      try {
-        res =
-          prepared.kind === "text"
-            ? await api.extractText(file.name, prepared.text, attempt)
-            : await api.extractFile(file.name, prepared.mimeType, prepared.base64, attempt);
-        break;
-      } catch (err) {
-        const retry = err instanceof ApiError && err.body?.retryable && attempt < WAITS.length;
-        if (!retry || src.cancelled) throw err;
-        const secs = Math.round(WAITS[attempt] / 1000);
-        src.message = `The AI is busy. Trying again in ${secs}s (try ${attempt + 1} of ${WAITS.length})…`;
-        render();
-        await new Promise((r) => setTimeout(r, WAITS[attempt]));
-        src.message = `Reading the invoice (try ${attempt + 1} of ${WAITS.length})…`;
-        render();
-      }
-    }
+    out = prepared.kind === "sheets" ? await readSpreadsheet(file, src, prepared.sheets, opts) : await readDocument(file, prepared, opts);
+    if (!out || src.cancelled) return; // removed from the list while it was being read, or not loaded
 
-    if (src.cancelled) return; // removed from the list while it was being read
-    for (const r of res.rows) {
-      state.rows.push(
-        makeRow({
-          sourceId: src.id,
-          title: r.title,
-          aiTitle: r.invoiceTitle ? r.title : "",
-          invoiceTitle: r.invoiceTitle ?? "",
-          supplierCode: r.supplierCode ?? "",
-          barcode: r.barcodeRepaired && r.barcode ? analyzeBarcode(r.barcode).digits : (r.barcode ?? ""),
-          barcodeNote: r.barcodeRepaired ? `The invoice said ${r.barcode}. Leading zero restored.` : "",
-          inStore: r.match === "exists" ? r.existing : null,
-          selected: r.match === "new" && r.barcodeStatus === "valid",
-        }),
-      );
+    // A run holds MAX_ROWS_PER_RUN products. (Spreadsheets ask which lines to load before getting here.)
+    const room = Math.max(0, MAX_ROWS_PER_RUN - state.rows.length);
+    let cut = 0;
+    if (out.rows.length > room) {
+      cut = out.rows.length - room;
+      out.rows = out.rows.slice(0, room);
     }
-    state.store = res.store;
-    const fromInvoice = res.invoice?.supplierName ?? "";
-    const matched = fromInvoice ? matchSupplier(fromInvoice, state.suppliers) : null;
+    for (const f of out.rows) state.rows.push(makeRow({ sourceId: src.id, ...f }));
+    if (out.store) state.store = out.store;
+    const fromInvoice = out.invoice?.supplierName ?? "";
+    // The supplier: an existing one is chosen for staff (they can change it); otherwise one is suggested.
+    const det = detectSupplier({ aiName: fromInvoice, topLines: out.topLines ?? [], fileNames: [file.name], suppliers: state.suppliers });
     Object.assign(src, {
       state: "done",
       message: "",
       supplierFromInvoice: fromInvoice,
-      invoiceNumber: res.invoice?.invoiceNumber ?? "",
+      supplierSuggestion: det.suggestion ?? "",
+      supplierFrom: det.from ?? "",
+      invoiceNumber: out.invoice?.invoiceNumber ?? "",
+      note: out.note ?? "",
     });
-    if (!(src.supplier ?? "").trim() && matched) Object.assign(src, { supplier: matched, supplierAuto: true });
-    if (!res.rows.length) {
+    if (!(src.supplier ?? "").trim() && det.match) Object.assign(src, { supplier: det.match, supplierAuto: true });
+    if (cut) {
+      toast("info", `This run is full, so the last ${plural(cut, "product")} from ${file.name} weren't loaded. Start a new import for them.`, { sticky: true });
+    }
+    if (out.skippedPages?.length) {
+      toast("bad", `${plural(out.skippedPages.length, "page")} of ${file.name} (${out.skippedPages.join(", ")}) had too many lines to read. Add those products by hand.`, { sticky: true });
+    }
+    if (!out.rows.length) {
       Object.assign(src, { state: "failed", message: "No products found in this file." });
       toast("bad", `No products found in ${file.name}. Check it's an invoice, or add products by hand.`);
     }
@@ -1747,10 +2033,209 @@ async function readInvoice(file, src) {
     const msg = errorText(err);
     Object.assign(src, { state: "failed", message: msg });
     if (!(err instanceof SessionExpired)) {
-      toast("bad", `Couldn't read ${file.name}. ${msg}`, { action: ["Add by hand", addManual] });
+      const busy = err instanceof ApiError && err.body?.retryable;
+      toast("bad", `Couldn't read ${file.name}. ${msg}`, { id: `read-${src.id}`, action: busy ? ["Try again", () => retrySource(src)] : ["Add by hand", addManual] });
     }
+    return render();
   }
   render();
+  // Tidy on its own queue, so the next file doesn't wait for this one's titles.
+  state.tidyQueue = state.tidyQueue.then(() => tidySource(src));
+}
+
+/**
+ * Excel / CSV. A table of products is read here, column by column (no line limit, exact barcodes);
+ * anything else is read by the AI, in parts when it's long.
+ */
+async function readSpreadsheet(file, src, sheets, opts) {
+  opts.onStatus("Working out the columns…");
+  const m = await reader.mapSheets(sheets, opts);
+  if (src.cancelled) return null;
+  if (!m.trusted) {
+    const res = await reader.readSheetsWithAi(file.name, sheets, opts);
+    if (!res) return null;
+    return { rows: res.rows.map(serverRowFields), invoice: res.invoice, store: res.store, topLines: topText(sheets, 3) };
+  }
+  const { items, invoice, skipped } = reader.readByColumns(sheets, m.map, m.aiMap);
+  let chosen = items;
+  const room = Math.max(0, MAX_ROWS_PER_RUN - state.rows.length);
+  if (items.length > room) {
+    const pick = room > 0 ? await chooseLines(file.name, items.length, room) : null;
+    if (!pick) {
+      Object.assign(src, {
+        state: "failed",
+        message: room > 0 ? "Not loaded." : `This run is full (${fmt(MAX_ROWS_PER_RUN)} products). Start a new import for this file.`,
+      });
+      render();
+      return null;
+    }
+    chosen = items.slice(pick.from - 1, pick.to);
+    src.name = `${file.name} (lines ${fmt(pick.from)}–${fmt(pick.to)})`;
+  }
+  opts.onStatus(`Checking ${plural(chosen.length, "product")} against your store…`);
+  const matched = await reader.matchAll(chosen.map(({ id, title, supplierCode, barcode }) => ({ id, title, supplierCode, barcode })));
+  if (src.cancelled) return null;
+  const byId = new Map(matched.rows.map((r) => [r.id, r]));
+  const rows = chosen.map((it) => {
+    const r = byId.get(it.id) ?? { ...it, match: "new", barcodeStatus: "missing" };
+    const f = serverRowFields({ ...r, quantity: it.quantity, unit: it.unit, unitsPer: it.unitsPer });
+    return {
+      ...f,
+      title: it.title,
+      ruleTitle: it.title,
+      aiTitle: "",
+      invoiceTitle: it.invoiceTitle,
+      // Products already in the store keep their store title, so theirs aren't tidied.
+      titlePending: !f.inStore && !!it.invoiceTitle,
+    };
+  });
+  const lost = skipped.headings + skipped.totals + skipped.notes;
+  return {
+    rows,
+    invoice,
+    store: matched.store,
+    topLines: topText(sheets, 3),
+    note: lost ? `${plural(lost, "line")} skipped: headings, totals and notes` : "",
+  };
+}
+
+/** PDF / photo: one AI read, or a few pages at a time when the answer doesn't fit in one reply. */
+async function readDocument(file, prepared, opts) {
+  opts.onStatus("Reading the invoice…");
+  try {
+    const res = await reader.withRetries((attempt) => api.extractFile(file.name, prepared.mimeType, prepared.base64, attempt), opts);
+    return { rows: res.rows.map(serverRowFields), invoice: res.invoice, store: res.store };
+  } catch (err) {
+    if (!reader.tooLong(err)) throw err;
+    if (prepared.mimeType !== "application/pdf") {
+      throw new ApiError("This photo has more lines than the AI can read at once. Take two photos, each showing half of the page.", 422, {});
+    }
+  }
+  const res = await reader.readPdfByPages(file.name, prepared.mimeType, prepared.base64, { ...opts, pageHint: prepared.pages });
+  if (!res) return null;
+  return { rows: res.rows.map(serverRowFields), invoice: res.invoice, store: res.store, skippedPages: res.skippedPages };
+}
+
+/** A file with more product lines than fit in this run: which lines to load. Null if cancelled. */
+async function chooseLines(name, total, room) {
+  const ranges = [];
+  for (let from = 1; from <= total; from += room) ranges.push({ from, to: Math.min(total, from + room - 1) });
+  const group = h(
+    "div",
+    { class: "line-ranges", role: "radiogroup", "aria-label": "Lines to load" },
+    ...ranges.map((r, i) =>
+      h("label", { class: "line-range" }, h("input", { type: "radio", name: "line-range", value: String(i), checked: i === 0 }), h("span", {}, `Lines ${fmt(r.from)}–${fmt(r.to)}`)),
+    ),
+  );
+  const ok = await confirmDialog({
+    title: `${fmt(total)} products in ${name}`,
+    ok: "Load these lines",
+    facts: [
+      fact("alert", `A run holds up to ${fmt(MAX_ROWS_PER_RUN)} products`, room < MAX_ROWS_PER_RUN ? `, and this one has room for ${fmt(room)}. Choose which lines to load:` : ". Choose which lines to load:"),
+      h("li", { class: "line-ranges-li" }, group),
+      fact("hand", "For the other lines, ", "start a new import and add this file again."),
+      fact("image", "Only want photos and descriptions for later? ", "Upload the list on Catalogues instead: it has no line limit."),
+    ],
+  });
+  if (!ok) return null;
+  return ranges[Number(group.querySelector("input:checked")?.value ?? 0)] ?? ranges[0];
+}
+
+/* =============================================================== tidying spreadsheet titles */
+
+/**
+ * Tidy the titles of one invoice's products, in checked batches. Rows show the rule-based tidy meanwhile.
+ * A title staff changed by hand is never overwritten (the AI's version is offered as an alternative).
+ */
+async function tidySource(src) {
+  const pending = state.rows.filter((r) => r.sourceId === src.id && r.titlePending);
+  if (!pending.length || src.cancelled) return;
+  const byKey = new Map();
+  for (const r of pending) {
+    const k = titleKey(r.invoiceTitle);
+    if (!k) {
+      r.titlePending = false;
+      continue;
+    }
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(r);
+  }
+  const jobs = [...byKey].map(([key, rows]) => ({ key, text: rows[0].invoiceTitle.slice(0, 400) }));
+  src.tidy = { done: 0, total: jobs.length };
+  render();
+  let res;
+  try {
+    res = await reader.tidyTitles(jobs, (src.supplier || src.supplierFromInvoice || "").trim() || null, {
+      isCancelled: () => !!src.cancelled,
+      onResult: (key, title) => {
+        for (const r of byKey.get(key) ?? []) {
+          r.titlePending = false;
+          clearTitleNote(r);
+          r.aiTitle = title;
+          if (r.title === r.ruleTitle) r.title = title;
+        }
+      },
+      onFail: (key) => {
+        for (const r of byKey.get(key) ?? []) {
+          r.titlePending = false;
+          if (r.title === r.ruleTitle) {
+            r.titleNote = "rules";
+            if (r.wasSelected === undefined) r.wasSelected = r.selected;
+            r.selected = false; // added only after someone has looked at the title
+          }
+        }
+      },
+      onProgress: (done, total) => {
+        src.tidy = { done, total };
+        scheduleRender();
+      },
+      onWait: (secs) => {
+        src.tidy = { ...src.tidy, wait: secs };
+        scheduleRender();
+      },
+    });
+  } catch (err) {
+    // Signed out part-way: leave the rest for when the run is opened again.
+    if (err instanceof SessionExpired) sessionExpired();
+  } finally {
+    delete src.tidy;
+  }
+  if (src.cancelled) return;
+  if (res?.stoppedBy && res.failed) {
+    toast("info", `${plural(res.failed, "title")} from ${src.name} couldn't be tidied by the AI, so simple rules tidied them. They're under Needs a look. (${res.stoppedBy})`, { sticky: true });
+  }
+  render();
+}
+
+/** Staff have dealt with a "Check title" row (edited it, picked a title, or said it's fine): tick it again if it was. */
+function clearTitleNote(row, tick = false) {
+  if (!row.titleNote && row.wasSelected === undefined) return;
+  row.titleNote = "";
+  if (row.wasSelected !== undefined) row.selected = row.wasSelected || tick;
+  else if (tick) row.selected = true;
+  delete row.wasSelected;
+}
+
+/** After opening a run: carry on tidying titles that were still waiting when it was saved. */
+function resumeTidying() {
+  for (const src of state.sources) {
+    if (state.rows.some((r) => r.sourceId === src.id && r.titlePending)) state.tidyQueue = state.tidyQueue.then(() => tidySource(src));
+  }
+}
+
+/** Staff asked to try the AI again on titles it couldn't tidy. */
+function retryTidy(src) {
+  let n = 0;
+  for (const r of state.rows) {
+    if (r.sourceId === src.id && r.titleNote && r.title === r.ruleTitle && r.invoiceTitle) {
+      r.titleNote = ""; // wasSelected is kept: a tidied title ticks the row again if it was ticked
+      r.titlePending = true;
+      n++;
+    }
+  }
+  if (!n) return;
+  render();
+  state.tidyQueue = state.tidyQueue.then(() => tidySource(src));
 }
 
 async function addManual() {
@@ -1793,6 +2278,7 @@ async function runLookup() {
       if (err instanceof SessionExpired) return sessionExpired();
       for (const row of batch) if (row.checked === false) row.checked = "error";
     }
+    scheduleRender(); // the counts and the message above the list follow along as each batch is checked
   }
   render();
 }
@@ -1845,8 +2331,22 @@ function confirmDialog({ title, facts, ok, danger = false }) {
   return new Promise((res) => dlg.addEventListener("close", () => res(dlg.returnValue === "ok"), { once: true }));
 }
 
-function confirmAdd(count, noBarcode, groups, withPhotos = 0) {
+function confirmAdd(count, noBarcode, groups, withPhotos = 0, stock = null, activate = 0) {
   const what = count === 1 ? "1 product" : `${fmt(count)} products`;
+  const stockFact = stock
+    ? stock.createUnits || stock.createRows
+      ? fact("scan", `Stock is counted. `, `${fmt(stock.createUnits)} ${stock.createUnits === 1 ? "unit goes" : "units go"} into the new products${stock.addRows ? `, and ${fmt(stock.addUnits)} ${stock.addUnits === 1 ? "unit is" : "units are"} added to ${plural(stock.addRows, "product")} already in your store` : ""}. Stock tracking is turned on for them.`)
+      : fact("scan", `Stock is added to ${plural(stock.addRows, "product")} already in your store `, `(${fmt(stock.addUnits)} ${stock.addUnits === 1 ? "unit" : "units"}). Stock tracking is turned on for them if it was off.`)
+    : fact("scan", "In-store only. ", "Not shippable, and stock isn't tracked.");
+  const activateFact = activate ? fact("store", `${plural(activate, "draft product")} in your store ${activate === 1 ? "is" : "are"} made active `, "and put on Point of Sale, like any other product. Their prices and details aren't changed.") : null;
+  if (!count && (stock?.addRows || activate)) {
+    const stocking = !!stock?.addRows;
+    return confirmDialog({
+      title: [activate ? `Activate ${plural(activate, "draft product")}` : "", stocking ? `${activate ? "add" : "Add"} stock to ${plural(stock.addRows, "product")}` : ""].filter(Boolean).join(" and ") + "?",
+      ok: activate && stocking ? "Activate and add stock" : activate ? "Activate" : "Add stock",
+      facts: [activateFact, stocking ? stockFact : null, stocking ? fact("hand", `Supplier: ${groups.map((g) => g.supplier).join(", ")}. `, "Importing the same invoice again won't add this stock twice.") : null].filter(Boolean),
+    });
+  }
   const supplierText = groups.map((g) => (groups.length > 1 ? `${g.supplier} (${g.count})` : g.supplier)).join(", ");
   return confirmDialog({
     title: `Add ${what} to Shopify?`,
@@ -1854,7 +2354,8 @@ function confirmAdd(count, noBarcode, groups, withPhotos = 0) {
     facts: [
       fact("store", "On Point of Sale straight away. ", "Not on your online store."),
       fact("alert", "Priced at $0.00. ", "Set prices in the POS app before selling."),
-      fact("scan", "In-store only. ", "Not shippable, and stock isn't tracked."),
+      stockFact,
+      activateFact,
       fact("hand", `Supplier: ${supplierText}. `, groups.length > 1 ? "Each invoice gets its own import ID." : `Import ID ${groups[0].importId}.`),
       withPhotos ? fact("image", `${withPhotos === count ? (count === 1 ? "It gets" : "All get") : `${fmt(withPhotos)} get`} photos `, "from your supplier catalogues.") : null,
       noBarcode
@@ -1892,18 +2393,43 @@ async function addSelected() {
   }
   const bySource = new Map(state.sources.map((s) => [s.id, s]));
 
+  // Lines for products already in the store: drafts are made active, and stock is added when the run does that.
+  const toExisting = chosen.filter((r) => snap.status.get(r.id) === "exists");
+  const toCreate = chosen.filter((r) => snap.status.get(r.id) !== "exists");
+  const extra = stockExtra;
+  const unitsFor = (r) => (stockOn() && r.qty > 0 ? r.qty + (extra.get(r.id) ?? 0) : 0);
+  const toActivate = toExisting.filter(needsActivation);
+  const toStock = toExisting.filter((r) => unitsFor(r) > 0);
+  const activateOnly = toActivate.filter((r) => !toStock.includes(r)).length;
+  const stockInfo = stockOn()
+    ? {
+        createRows: toCreate.filter((r) => unitsFor(r) > 0).length,
+        createUnits: toCreate.reduce((n, r) => n + unitsFor(r), 0),
+        addRows: toStock.length,
+        addUnits: toStock.reduce((n, r) => n + unitsFor(r), 0),
+      }
+    : null;
+
   const noBarcode = chosen.filter((r) => snap.status.get(r.id) === "missing").length;
   const withPhotos = chosen.filter((r) => rowPhotos(r).length).length;
-  if (!(await confirmAdd(chosen.length, noBarcode, groups, withPhotos))) return;
+  if (!(await confirmAdd(toCreate.length, noBarcode, groups, withPhotos, stockInfo, toActivate.length))) return;
+  // Catalogue entries saved in short form (run reopened): fetch them in full first, for their descriptions.
+  if (chosen.some((r) => r.catalogue?.slim)) {
+    for (let i = 0; i < 100 && catBusy; i++) await new Promise((r) => setTimeout(r, 100));
+    if (chosen.some((r) => r.catalogue?.slim)) await runCatalogue();
+    const still = chosen.filter((r) => r.catalogue?.slim).length;
+    if (still) toast("info", `Couldn't load the catalogue for ${plural(still, "product")}, so ${still === 1 ? "it's" : "they're"} added without the catalogue description. Photos are still added.`);
+  }
 
   closeDrawerSilently();
   const size = state.health?.maxCreateBatch ?? 15;
   state.creating = { done: 0, total: chosen.length };
-  const tally = { created: 0, skipped: 0, failed: 0, notOnPos: 0, photos: 0, photoErrors: 0 };
+  const tally = { created: 0, skipped: 0, failed: 0, notOnPos: 0, photos: 0, photoErrors: 0, stockUnits: 0, stockProducts: 0, stockRepeat: 0, stockFailed: 0, activated: 0, activatedNotOnPos: 0, activateFailed: 0 };
+  const invoiceRef = (src) => (src?.invoiceNumber ? `${(src.supplier ?? "").trim()}|${src.invoiceNumber}` : "");
   render();
 
-  for (let i = 0; i < chosen.length; i += size) {
-    const batch = chosen.slice(i, i + size);
+  for (let i = 0; i < toCreate.length; i += size) {
+    const batch = toCreate.slice(i, i + size);
     batch.forEach((r) => (r.adding = true));
     render();
     try {
@@ -1914,12 +2440,15 @@ async function addSelected() {
           title,
           supplierCode,
           barcode,
+          qty: unitsFor({ id, qty: state.rows.find((x) => x.id === id)?.qty }) || null,
+          invoiceRef: invoiceRef(bySource.get(sourceId)),
           photos: catalogue ? photos : [],
           description: catalogue?.description && useDescription !== false ? catalogue.description : null,
           invoiceId: sourceId,
           vendor: bySource.get(sourceId)?.supplier.trim() || null,
           importId: bySource.get(sourceId)?.importId ?? null,
         })),
+        stockOn(),
       );
       const byId = new Map(res.results.map((r) => [r.id, r]));
       for (const row of batch) {
@@ -1929,6 +2458,11 @@ async function addSelected() {
           row.result = { status: "created", productId: r.productId };
           row.selected = false;
           tally.created++;
+          if (r.stock > 0) {
+            row.stockResult = { status: "added", qty: r.stock };
+            tally.stockUnits += r.stock;
+            tally.stockProducts++;
+          }
           if (r.photos) tally.photos++;
           if (r.photoError) tally.photoErrors++;
           if (r.publishedToPos === false) tally.notOnPos++;
@@ -1958,7 +2492,96 @@ async function addSelected() {
         tally.failed++;
       }
     }
-    state.creating.done = Math.min(chosen.length, i + batch.length);
+    state.creating.done = Math.min(toCreate.length, i + batch.length);
+    render();
+  }
+
+  // Drafts already in the store become active products (and go on Point of Sale), whether or not stock is added.
+  for (let i = 0; i < toActivate.length && !state.sessionExpired; i += size) {
+    const batch = toActivate.slice(i, i + size);
+    batch.forEach((r) => (r.adding = true));
+    render();
+    try {
+      const res = await api.activate(batch.map((r) => ({ id: r.id, productId: r.inStore.productId })));
+      const byId = new Map(res.results.map((x) => [x.id, x]));
+      for (const row of batch) {
+        const x = byId.get(row.id);
+        row.adding = false;
+        if (x?.status === "activated" || x?.status === "skipped") {
+          // "skipped": someone already made it active (or archived it) in Shopify since this list was checked.
+          row.activated = x.status === "activated";
+          row.activateError = "";
+          row.inStore = { ...row.inStore, status: "ACTIVE" };
+          if (x.status === "activated") {
+            tally.activated++;
+            if (x.published === false) tally.activatedNotOnPos++;
+          }
+          if (!toStock.includes(row)) row.selected = false;
+        } else {
+          row.activateError = x?.error ?? "No answer from Shopify.";
+          tally.activateFailed++;
+        }
+      }
+    } catch (err) {
+      batch.forEach((r) => (r.adding = false));
+      if (err instanceof SessionExpired) {
+        sessionExpired();
+        break;
+      }
+      for (const row of batch) row.activateError = errorText(err);
+      tally.activateFailed += batch.length;
+    }
+    state.creating.done = Math.min(chosen.length, toCreate.length + Math.min(activateOnly, i + batch.length));
+    render();
+  }
+
+  // Products already in the store: add the invoice quantity to their stock.
+  for (let i = 0; i < toStock.length && !state.sessionExpired; i += size) {
+    const batch = toStock.slice(i, i + size);
+    batch.forEach((r) => (r.adding = true));
+    render();
+    try {
+      const res = await api.stock(
+        state.run.code,
+        batch.map((r) => ({
+          id: r.id,
+          productId: r.inStore.productId,
+          title: r.title,
+          supplierCode: r.supplierCode,
+          barcode: r.barcode,
+          qty: unitsFor(r),
+          invoiceId: r.sourceId,
+          invoiceRef: invoiceRef(bySource.get(r.sourceId)),
+          importId: bySource.get(r.sourceId)?.importId ?? null,
+        })),
+      );
+      const byId = new Map(res.results.map((x) => [x.id, x]));
+      for (const row of batch) {
+        const x = byId.get(row.id);
+        row.adding = false;
+        if (x?.status === "added") {
+          row.stockResult = { status: "added", qty: x.qty };
+          row.selected = false;
+          tally.stockUnits += x.qty;
+          tally.stockProducts++;
+        } else if (x?.status === "skipped") {
+          row.selected = false;
+          if (x.reason === "already_added") (row.stockResult = { status: "added", qty: 0, already: true }), tally.stockRepeat++;
+        } else {
+          row.stockResult = { status: "failed", error: x?.error ?? "No answer from Shopify. Check the stock in Shopify before trying again." };
+          tally.stockFailed++;
+        }
+      }
+    } catch (err) {
+      batch.forEach((r) => (r.adding = false));
+      if (err instanceof SessionExpired) {
+        sessionExpired();
+        break;
+      }
+      for (const row of batch) row.stockResult = { status: "failed", error: `${errorText(err)} Check the stock in Shopify before trying again.` };
+      tally.stockFailed += batch.length;
+    }
+    state.creating.done = Math.min(chosen.length, toCreate.length + activateOnly + i + batch.length);
     render();
   }
 
@@ -1974,25 +2597,41 @@ async function addSelected() {
 
 async function undoImport(src) {
   const rows = sourceRows(src).filter((r) => r.result?.status === "created");
-  if (!rows.length || !src.importId || state.undoing) return;
+  const stocked = sourceRows(src).filter(stockedRow);
+  if ((!rows.length && !stocked.length) || !src.importId || state.undoing) return;
   const n = plural(rows.length, "product");
+  const units = stocked.reduce((t, r) => t + r.stockResult.qty, 0);
   const ok = await confirmDialog({
     title: `Undo import ${src.importId}?`,
-    ok: `Delete ${n}`,
+    ok: rows.length ? `Delete ${n}` : "Take back stock",
     danger: true,
     facts: [
-      fact("trash", `Deletes the ${n} `, `added to Shopify from ${src.name}.`),
-      fact("check", "Products that already have a price are kept, ", "so nobody's work is lost."),
-      fact("alert", "Deleted products can't be brought back. ", "They stay in this list, so you can fix them and add them again.", true),
-    ],
+      rows.length ? fact("trash", `Deletes the ${n} `, `added to Shopify from ${src.name}.`) : null,
+      stocked.length ? fact("scan", `Takes back ${fmt(units)} ${units === 1 ? "unit" : "units"} of stock `, `this invoice added to ${plural(stocked.length, "product")} already in your store. If some have sold since, their count goes lower.`, true) : null,
+      rows.length ? fact("check", "Products that already have a price are kept, ", "so nobody's work is lost.") : null,
+      rows.length ? fact("alert", "Deleted products can't be brought back. ", "They stay in this list, so you can fix them and add them again.", true) : null,
+    ].filter(Boolean),
   });
   if (!ok) return;
 
   state.undoing = src.id;
   render();
   const size = state.health?.maxUndoBatch ?? 20;
-  const tally = { deleted: 0, priced: 0, other: 0, failed: 0 };
+  const tally = { deleted: 0, priced: 0, other: 0, failed: 0, stockBack: 0, stockFailed: 0 };
   try {
+    for (let i = 0; i < stocked.length; i += 15) {
+      const batch = stocked.slice(i, i + 15);
+      const res = await api.undoStock(src.importId, batch.map((r) => r.inStore.productId));
+      const byId = new Map(res.results.map((x) => [x.id, x]));
+      for (const row of batch) {
+        const x = byId.get(row.inStore.productId);
+        if (x?.status === "removed" || x?.status === "kept") {
+          row.stockResult = null;
+          row.selected = false;
+          if (x.status === "removed") tally.stockBack += x.qty;
+        } else tally.stockFailed++;
+      }
+    }
     for (let i = 0; i < rows.length; i += size) {
       const batch = rows.slice(i, i + size);
       const res = await api.undo(src.importId, batch.map((r) => r.result.productId));
@@ -2001,7 +2640,7 @@ async function undoImport(src) {
         const r = byId.get(row.result.productId);
         if (r?.status === "deleted" || (r?.status === "kept" && r.reason === "gone")) {
           // Back to "New", ready to be fixed and added again.
-          Object.assign(row, { result: null, selected: false, inStore: null, checked: true });
+          Object.assign(row, { result: null, stockResult: null, selected: false, inStore: null, checked: true });
           tally.deleted++;
         } else if (r?.status === "kept" && r.reason === "priced") tally.priced++;
         else if (r?.status === "kept") tally.other++;
@@ -2013,24 +2652,39 @@ async function undoImport(src) {
   } finally {
     state.undoing = null;
     if (state.run) {
-      state.run.liveByInvoice = { ...state.run.liveByInvoice, [src.id]: sourceRows(src).filter((r) => r.result?.status === "created").length };
+      state.run.liveByInvoice = { ...state.run.liveByInvoice, [src.id]: sourceRows(src).filter((r) => r.result?.status === "created" || stockedRow(r)).length };
     }
     render();
   }
-  const parts = [`Deleted ${plural(tally.deleted, "product")} from Shopify.`];
+  const parts = [];
+  if (rows.length) parts.push(`Deleted ${plural(tally.deleted, "product")} from Shopify.`);
+  if (tally.stockBack) parts.push(`Took ${fmt(tally.stockBack)} ${tally.stockBack === 1 ? "unit" : "units"} of stock back out.`);
+  if (tally.stockFailed) parts.push(`${plural(tally.stockFailed, "product's stock")} couldn't be taken back. Press Undo import again.`);
   if (tally.priced) parts.push(`${plural(tally.priced, "was", "were")} kept because ${tally.priced === 1 ? "it already has" : "they already have"} a price.`);
   if (tally.other) parts.push(`${plural(tally.other, "was", "were")} kept because ${tally.other === 1 ? "it no longer belongs" : "they no longer belong"} to this import.`);
   if (tally.failed) parts.push(`${plural(tally.failed, "couldn't", "couldn't")} be deleted. Try again.`);
-  toast(tally.failed ? "bad" : "ok", parts.join(" "), { sticky: tally.priced + tally.other + tally.failed > 0 });
+  toast(tally.failed || tally.stockFailed ? "bad" : "ok", parts.join(" "), { sticky: tally.priced + tally.other + tally.failed + tally.stockFailed > 0 });
 }
 
-function showDone({ created, skipped, failed, notOnPos, photos = 0 }, groups = []) {
+function showDone({ created, skipped, failed, notOnPos, photos = 0, stockUnits = 0, stockProducts = 0, stockRepeat = 0, stockFailed = 0, activated = 0, activatedNotOnPos = 0, activateFailed = 0 }, groups = []) {
   const dlg = $("#done");
   const mark = $("#dn-mark");
-  mark.className = `done-mark${failed || notOnPos ? " is-partial" : ""}`;
-  mark.replaceChildren(icon(failed || notOnPos ? "alert" : "check", 30));
-  $("#dn-title").textContent = created === 0 ? "Nothing was added" : created === 1 ? "1 product added" : `${fmt(created)} products added`;
+  const partial = failed || notOnPos || stockFailed || activateFailed || activatedNotOnPos;
+  mark.className = `done-mark${partial ? " is-partial" : ""}`;
+  mark.replaceChildren(icon(partial ? "alert" : "check", 30));
+  $("#dn-title").textContent =
+    created === 0 && (stockProducts > 0 || activated > 0)
+      ? [activated ? `${plural(activated, "draft product")} made active` : "", stockProducts ? `${activated ? "stock" : "Stock"} added to ${plural(stockProducts, "product")}` : ""].filter(Boolean).join(" and ")
+      : created === 0
+        ? "Nothing was added"
+        : created === 1 ? "1 product added" : `${fmt(created)} products added`;
   const bits = [];
+  if (activated) bits.push(`${plural(activated, "draft product was", "draft products were")} in your store, so ${activated === 1 ? "it was" : "they were"} made active${activated > activatedNotOnPos ? " and put on Point of Sale" : ""}.`);
+  if (activatedNotOnPos) bits.push(`${plural(activatedNotOnPos, "was", "were")} made active but couldn't be put on Point of Sale. In Shopify, open ${activatedNotOnPos === 1 ? "it" : "them"} and turn on the Point of Sale channel.`);
+  if (activateFailed) bits.push(`${plural(activateFailed, "draft product")} couldn't be made active: ${activateFailed === 1 ? "it's" : "they're"} marked in the list.`);
+  if (stockProducts) bits.push(`${fmt(stockUnits)} ${stockUnits === 1 ? "unit" : "units"} of stock added across ${plural(stockProducts, "product")}.`);
+  if (stockRepeat) bits.push(`${plural(stockRepeat, "product")} already had this invoice's stock added, so nothing was added twice.`);
+  if (stockFailed) bits.push(`${plural(stockFailed, "product")} didn't get its stock: ${stockFailed === 1 ? "it's" : "they're"} marked in the list. Check the stock in Shopify before trying again.`);
   if (created && notOnPos < created) bits.push("They're on Point of Sale now. Set their prices in the POS app.");
   if (photos) bits.push(`${photos === created ? (created === 1 ? "It has" : "All have") : `${fmt(photos)} have`} photos from the catalogue.`);
   if (notOnPos) bits.push(`${plural(notOnPos, "was", "were")} created but couldn't be put on Point of Sale. In Shopify, open ${notOnPos === 1 ? "it" : "them"} and turn on the Point of Sale channel.`);
@@ -2038,7 +2692,7 @@ function showDone({ created, skipped, failed, notOnPos, photos = 0 }, groups = [
   if (failed) bits.push(`${plural(failed, "product", "products")} couldn't be added. ${failed === 1 ? "It's" : "They're"} under Needs a look.`);
   $("#dn-sub").textContent = bits.join(" ");
   $("#dn-ids").replaceChildren(
-    ...(created
+    ...(created || stockProducts
       ? groups.map((g) =>
           h(
             "button",
@@ -2107,6 +2761,7 @@ const catalogues = createCatalogues({
   SessionExpired,
   ApiError,
   sessionExpired: () => sessionExpired(),
+  navigate: (path) => navigate(path),
 });
 
 async function checkHealth() {
@@ -2123,7 +2778,7 @@ async function checkHealth() {
       toast("bad", `Shopify isn't connected, so products can't be checked or added. ${hl.shopifyError ?? ""}`.trim(), { sticky: true, id: "shopify" });
     }
     else if (!hl.posChannel) toast("bad", "The Point of Sale channel wasn't found. New products would be created but not shown on POS.", { sticky: true, id: "pos" });
-    if (state.view === "settings") settingsPage.renderToggles();
+    if (state.view === "settings") settingsPage.refresh();
   } catch (err) {
     if (err instanceof SessionExpired) return sessionExpired();
     $("#conn").dataset.state = "bad";
@@ -2218,7 +2873,7 @@ function wire() {
 
   $("#select-all").addEventListener("change", (e) => {
     const snap = snapshot();
-    for (const r of visibleRows(snap.status)) if (SELECTABLE.has(snap.status.get(r.id))) r.selected = e.target.checked;
+    for (const r of visibleRows(snap.status)) if (isSelectable(r, snap.status.get(r.id))) r.selected = e.target.checked;
     render();
   });
 
@@ -2239,6 +2894,10 @@ function wire() {
   });
 
   $("#recheck").addEventListener("click", recheck);
+  $("#stock-toggle").addEventListener("change", (e) => {
+    state.stock = e.target.checked;
+    render();
+  });
   $("#add-manual").addEventListener("click", addManual);
   $("#manual-start").addEventListener("click", addManual);
   $("#fix-start").addEventListener("click", startFix);

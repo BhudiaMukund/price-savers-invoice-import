@@ -3,7 +3,7 @@
 //  1. A loose check on the fingerprints picks the few stored photos worth a close look.
 //  2. A 64 x 64 pixel-by-pixel comparison decides (see phash.js for how strict it is).
 
-import { maybeSame, parseSignature, sameByThumb, signatureOf } from "./phash.js";
+import { maybeSame, maybeSameProduct, parseSignature, sameByThumb, signatureOf } from "./phash.js";
 
 let fflate = null;
 const FFLATE = "/vendor/fflate.min.js";
@@ -43,7 +43,13 @@ export async function describe(bytes, type) {
 
 /** The photos already stored, with their fingerprints, for comparing new ones against. */
 export async function loadLibrary(api) {
-  const { files } = await api.photoSignatures();
+  const files = [];
+  for (let after = 0, pages = 0; pages < 200; pages++) {
+    const page = await api.photoSignatures(after);
+    files.push(...page.files);
+    if (!page.next) break;
+    after = page.next;
+  }
   const stored = files.map((f) => ({ fileId: f.fileId, pixels: f.pixels ?? 0, parsed: parseSignature(f.sig) })).filter((f) => f.parsed);
   const thumbs = new Map();
   return {
@@ -59,12 +65,29 @@ export async function loadLibrary(api) {
       }
       return cands.find((c) => sameByThumb(d.thumb, thumbs.get(c.fileId))) ?? null;
     },
+    /** The same picture twice on one product: compare with the other photos of that product only. */
+    async matchSiblings(d, siblingIds, exclude = null) {
+      if (!d?.parsed || !siblingIds?.length) return null;
+      const ids = new Set(siblingIds);
+      const cands = stored.filter((s) => s.fileId !== exclude && ids.has(s.fileId) && maybeSameProduct(d.parsed, s.parsed));
+      const need = cands.map((c) => c.fileId).filter((id) => !thumbs.has(id));
+      for (let i = 0; i < need.length; i += 200) {
+        const res = await api.photoThumbs(need.slice(i, i + 200));
+        for (const id of need.slice(i, i + 200)) thumbs.set(id, res.thumbs[id] ? await unpackThumb(res.thumbs[id]) : null);
+      }
+      return cands.find((c) => sameByThumb(d.thumb, thumbs.get(c.fileId))) ?? null;
+    },
     add(fileId, d) {
       if (!d?.parsed) return;
       stored.push({ fileId, pixels: d.pixels, parsed: d.parsed });
       thumbs.set(fileId, d.thumb);
     },
   };
+}
+
+/** Two photos of one product are the same picture (an Excel thumbnail beside its full-size copy, a stretched one). */
+export function sameOnProduct(a, b) {
+  return !!(a?.parsed && b?.parsed && maybeSameProduct(a.parsed, b.parsed) && sameByThumb(a.thumb, b.thumb));
 }
 
 /** Which of two look-alikes to keep: the clearly sharper one (1.5x the pixels), otherwise the one stored first. */
@@ -99,12 +122,13 @@ export function tidyLibrary(api) {
             d = null;
           }
           if (!d) return merged; // Shopify's copies can't be read from this page: stop quietly
-          fresh.push({ fileId: f.fileId, d });
+          fresh.push({ fileId: f.fileId, d, siblings: f.siblings ?? [] });
         }
         await api.saveSignatures(await Promise.all(fresh.map(async (f) => ({ fileId: f.fileId, sig: f.d.sig, thumb: await packThumb(f.d.thumb), pixels: f.d.pixels }))));
         const pairs = [];
         for (const f of fresh) {
-          const hit = await library.match(f.d, f.fileId);
+          // Look-alike of a stored photo, or the same picture as another photo of the same product.
+          const hit = (await library.match(f.d, f.fileId)) ?? (await library.matchSiblings(f.d, f.siblings, f.fileId));
           if (hit) {
             const keep = keepOf({ fileId: f.fileId, pixels: f.d.pixels }, hit);
             pairs.push(keep.fileId === f.fileId ? { from: hit.fileId, to: f.fileId } : { from: f.fileId, to: hit.fileId });

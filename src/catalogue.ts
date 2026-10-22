@@ -9,13 +9,15 @@
  * fresh export from a supplier replaces the old one, and undoing it brings the previous one back.
  */
 import { analyzeBarcode } from "./barcode";
-import { ensureSchema, StoreError, type Db } from "./store";
+import { ensureSchema, StoreError, type Db, type Stmt } from "./store";
 
 export const CATALOGUE_CODE_RE = /^C\d{1,9}$/;
 export const FILE_ID_RE = /^gid:\/\/shopify\/(MediaImage|GenericFile)\/\d+$/;
 export const MAX_PHOTOS_PER_ITEM = 12;
 /** D1 allows 100 bound values per statement. */
 const IN_CHUNK = 90;
+/** Statements sent to D1 in one batch (a batch counts as one call against the Worker's limit). */
+const BATCH_STATEMENTS = 200;
 
 const now = () => new Date().toISOString();
 
@@ -206,7 +208,7 @@ export class CatalogueStore {
           `SELECT f.fingerprint, COALESCE(m.file_id, f.file_id) AS file_id, COALESCE(m.status, f.status) AS status, COALESCE(m.url, f.url) AS url
            FROM catalogue_files f LEFT JOIN catalogue_files m ON m.file_id = f.merged_into
            WHERE f.fingerprint IN (${part.map(() => "?").join(",")})
-             AND (f.status != 'deleted' OR (m.file_id IS NOT NULL AND m.status != 'deleted'))`,
+             AND ((f.status NOT IN ('deleted', 'failed')) OR (m.file_id IS NOT NULL AND m.status NOT IN ('deleted', 'failed')))`,
         )
         .bind(...part)
         .all<{ fingerprint: string; file_id: string; status: PhotoInfo["status"]; url: string | null }>();
@@ -216,13 +218,77 @@ export class CatalogueStore {
   }
 
   async addFile(f: { fileId: string; fingerprint: string | null; uploadId: number; status: PhotoInfo["status"]; url: string | null; source: string; error?: string | null }) {
-    await this.db
-      .prepare(
-        `INSERT INTO catalogue_files (file_id, fingerprint, upload_id, status, url, error, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(file_id) DO NOTHING`,
-      )
-      .bind(f.fileId, f.fingerprint, f.uploadId, f.status, f.url, f.error ?? null, f.source.slice(0, 300), now())
-      .run();
+    const insert = (fingerprint: string | null) =>
+      this.db
+        .prepare(
+          `INSERT INTO catalogue_files (file_id, fingerprint, upload_id, status, url, error, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(file_id) DO NOTHING`,
+        )
+        .bind(f.fileId, fingerprint, f.uploadId, f.status, f.url, f.error ?? null, f.source.slice(0, 300), now())
+        .run();
+    if (f.fingerprint) {
+      // A photo deleted earlier (an undone catalogue) or one Shopify couldn't process no longer owns its
+      // fingerprint: the same picture uploaded again takes it over.
+      await this.db
+        .prepare(
+          `UPDATE catalogue_files SET fingerprint = NULL WHERE fingerprint = ? AND file_id != ?
+             AND (status = 'failed' OR (status = 'deleted' AND (merged_into IS NULL OR merged_into IN (SELECT file_id FROM catalogue_files WHERE status = 'deleted'))))`,
+        )
+        .bind(f.fingerprint, f.fileId)
+        .run();
+    }
+    try {
+      await insert(f.fingerprint);
+    } catch (e) {
+      // Two people saving the same picture at the same moment: keep this copy, just without the fingerprint.
+      if (!f.fingerprint || !/UNIQUE/i.test(String(e))) throw e;
+      await insert(null);
+    }
+  }
+
+  /**
+   * Save many files in two database calls (one per file took 50+ in a batch of 25 links). If one of them
+   * clashes with a fingerprint someone else just saved, the whole batch is saved one at a time instead.
+   * Returns the ones that couldn't be saved.
+   */
+  async addFiles(list: Parameters<CatalogueStore["addFile"]>[0][]): Promise<Map<number, string>> {
+    const failed = new Map<number, string>();
+    if (!list.length) return failed;
+    await this.ready();
+    const prints = list.filter((f) => f.fingerprint);
+    try {
+      if (prints.length) {
+        await this.db.batch(
+          prints.map((f) =>
+            this.db
+              .prepare(
+                `UPDATE catalogue_files SET fingerprint = NULL WHERE fingerprint = ? AND file_id != ?
+                   AND (status = 'failed' OR (status = 'deleted' AND (merged_into IS NULL OR merged_into IN (SELECT file_id FROM catalogue_files WHERE status = 'deleted'))))`,
+              )
+              .bind(f.fingerprint, f.fileId),
+          ),
+        );
+      }
+      await this.db.batch(
+        list.map((f) =>
+          this.db
+            .prepare(
+              `INSERT INTO catalogue_files (file_id, fingerprint, upload_id, status, url, error, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(file_id) DO NOTHING`,
+            )
+            .bind(f.fileId, f.fingerprint, f.uploadId, f.status, f.url, f.error ?? null, f.source.slice(0, 300), now()),
+        ),
+      );
+    } catch {
+      for (let i = 0; i < list.length; i++) {
+        try {
+          await this.addFile(list[i]!);
+        } catch (e) {
+          failed.set(i, e instanceof Error ? e.message : String(e));
+        }
+      }
+    }
+    return failed;
   }
 
   /** A photo that never reached Shopify (bad link, expired link). Kept so staff see what failed. */
@@ -269,12 +335,20 @@ export class CatalogueStore {
   /* ---------------------------------------------------------------- look-alike photos */
 
   /** Visual fingerprints of every stored photo (thumbnails are fetched separately, only when needed). */
-  async signatures(): Promise<{ fileId: string; sig: string; pixels: number | null }[]> {
+  /** One page of fingerprints (a big library is too much for one request): `next` is where the next page starts. */
+  async signatures(after = 0, limit = 500): Promise<{ files: { fileId: string; sig: string; pixels: number | null }[]; next: number | null }> {
     await this.ready();
     const { results } = await this.db
-      .prepare(`SELECT file_id, sig, pixels FROM catalogue_files WHERE status IN ('ready', 'processing') AND sig IS NOT NULL AND file_id LIKE 'gid:%'`)
-      .all<{ file_id: string; sig: string; pixels: number | null }>();
-    return results.map((r) => ({ fileId: r.file_id, sig: r.sig, pixels: r.pixels === null ? null : Number(r.pixels) }));
+      .prepare(
+        `SELECT rowid AS rid, file_id, sig, pixels FROM catalogue_files
+         WHERE rowid > ? AND status IN ('ready', 'processing') AND sig IS NOT NULL AND file_id LIKE 'gid:%' ORDER BY rowid LIMIT ?`,
+      )
+      .bind(after, limit)
+      .all<{ rid: number; file_id: string; sig: string; pixels: number | null }>();
+    return {
+      files: results.map((r) => ({ fileId: r.file_id, sig: r.sig, pixels: r.pixels === null ? null : Number(r.pixels) })),
+      next: results.length === limit ? Number(results[results.length - 1]!.rid) : null,
+    };
   }
 
   /** Ready photos with no fingerprint yet (from links, or stored before fingerprints existed). */
@@ -285,6 +359,24 @@ export class CatalogueStore {
       .bind(limit)
       .all<{ file_id: string; url: string }>();
     return results.map((r) => ({ fileId: r.file_id, url: r.url }));
+  }
+
+  /** For each photo, the other photos on the same products (the same picture can be on a product twice). */
+  async siblingsOf(fileIds: string[]): Promise<Record<string, string[]>> {
+    await this.ready();
+    const out: Record<string, string[]> = {};
+    for (let i = 0; i < fileIds.length; i += IN_CHUNK) {
+      const part = fileIds.slice(i, i + IN_CHUNK);
+      const { results } = await this.db
+        .prepare(
+          `SELECT DISTINCT a.file_id AS fid, b.file_id AS sib FROM catalogue_photos a JOIN catalogue_photos b ON b.item_id = a.item_id AND b.file_id != a.file_id
+           WHERE a.file_id IN (${part.map(() => "?").join(",")})`,
+        )
+        .bind(...part)
+        .all<{ fid: string; sib: string }>();
+      for (const r of results) (out[r.fid] ??= []).push(r.sib);
+    }
+    return out;
   }
 
   async countMissingSignatures(): Promise<number> {
@@ -348,30 +440,33 @@ export class CatalogueStore {
   async addItems(code: string, items: CatalogueItemIn[]): Promise<number> {
     const up = await this.open(code);
     if (up.finished_at) throw new StoreError("This catalogue upload is already finished.", 409);
-    let added = 0;
-    for (const it of items) {
-      const bc = analyzeBarcode(it.barcode);
-      const ck = codeKey(it.code);
-      if (!bc.key && !ck) continue; // nothing to match on
-      const res = await this.db
-        .prepare(
-          `INSERT INTO catalogue_items (upload_id, supplier_key, barcode, barcode_key, code, code_key, title, description, mixed)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .bind(up.id, up.supplier_key, bc.key ? bc.digits : null, bc.key, it.code, ck, it.title, it.description, it.mixed ? 1 : 0)
-        .run();
-      const itemId = Number(res.meta.last_row_id);
-      const photos = [...new Set(it.photos)].slice(0, MAX_PHOTOS_PER_ITEM);
-      if (photos.length) {
-        await this.db.batch(
-          photos.map((fileId, position) =>
-            this.db.prepare(`INSERT OR IGNORE INTO catalogue_photos (item_id, file_id, position) VALUES (?, ?, ?)`).bind(itemId, fileId, position),
-          ),
+    // Workers' free plan allows about 50 database calls per request, so this is a few batches however many
+    // products come in (one call per product would run out at 25).
+    const rows = items
+      .map((it) => ({ it, bc: analyzeBarcode(it.barcode), ck: codeKey(it.code) }))
+      .filter((r) => r.bc.key || r.ck); // nothing to match on: skipped
+    for (let i = 0; i < rows.length; i += BATCH_STATEMENTS) {
+      const part = rows.slice(i, i + BATCH_STATEMENTS);
+      const inserted = await this.db.batch(
+        part.map((r) =>
+          this.db
+            .prepare(
+              `INSERT INTO catalogue_items (upload_id, supplier_key, barcode, barcode_key, code, code_key, title, description, mixed)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .bind(up.id, up.supplier_key, r.bc.key ? r.bc.digits : null, r.bc.key, r.it.code, r.ck, r.it.title, r.it.description, r.it.mixed ? 1 : 0),
+        ),
+      );
+      const links: Stmt[] = [];
+      part.forEach((r, k) => {
+        const itemId = Number(inserted[k]!.meta.last_row_id);
+        [...new Set(r.it.photos)].slice(0, MAX_PHOTOS_PER_ITEM).forEach((fileId, position) =>
+          links.push(this.db.prepare(`INSERT OR IGNORE INTO catalogue_photos (item_id, file_id, position) VALUES (?, ?, ?)`).bind(itemId, fileId, position)),
         );
-      }
-      added++;
+      });
+      for (let k = 0; k < links.length; k += BATCH_STATEMENTS) await this.db.batch(links.slice(k, k + BATCH_STATEMENTS));
     }
-    return added;
+    return rows.length;
   }
 
   async finish(code: string): Promise<UploadSummary> {
@@ -500,6 +595,114 @@ export class CatalogueStore {
 
   /* ---------------------------------------------------------------- undo */
 
+  /* ---------------------------------------------------------------- photos on store products */
+
+  async recordAttachments(rows: { productId: string; title: string; mediaId: string | null; fileId: string; source: "invoice" | "fill" }[], user: string) {
+    if (!rows.length) return;
+    await this.ready();
+    const t = now();
+    await this.db.batch(
+      rows.map((r) =>
+        this.db
+          .prepare(`INSERT INTO product_photos (product_id, product_title, media_id, file_id, source, attached_at, attached_by) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+          .bind(r.productId, r.title.slice(0, 255), r.mediaId, r.fileId, r.source, t, user),
+      ),
+    );
+  }
+
+  /** Products deleted from the store (Undo import): their photo copies went with them. */
+  async markProductsGone(productIds: string[], user: string) {
+    if (!productIds.length) return;
+    await this.ready();
+    const t = now();
+    await this.db.batch(
+      productIds.map((id) =>
+        this.db
+          .prepare(`UPDATE product_photos SET removed_at = ?, removed_by = ?, removed_reason = 'product_deleted' WHERE product_id = ? AND removed_at IS NULL`)
+          .bind(t, user, id),
+      ),
+    );
+  }
+
+  /** Photos this upload would delete if removed: its own, minus ones a still-active upload also uses. */
+  private ownedSql = `upload_id = ? AND status != 'deleted' AND file_id LIKE 'gid:%' AND NOT EXISTS (
+       SELECT 1 FROM catalogue_photos p JOIN catalogue_items i ON i.id = p.item_id JOIN catalogue_uploads u ON u.id = i.upload_id
+       WHERE p.file_id = catalogue_files.file_id AND u.undone_at IS NULL AND u.id != ?)`;
+
+  /** Store products using photos from this upload (that removing it would take away). */
+  async removalImpact(code: string): Promise<{ products: number; titles: string[] }> {
+    await this.ready();
+    const up = await this.row(code);
+    if (!up) throw new StoreError("Catalogue upload not found.", 404);
+    const { results } = await this.db
+      .prepare(
+        `SELECT product_id, MAX(product_title) AS title FROM product_photos
+         WHERE removed_at IS NULL AND file_id IN (SELECT file_id FROM catalogue_files WHERE ${this.ownedSql})
+         GROUP BY product_id ORDER BY MAX(attached_at) DESC`,
+      )
+      .bind(up.id, up.id)
+      .all<{ product_id: string; title: string | null }>();
+    return { products: results.length, titles: results.slice(0, 8).map((r) => r.title ?? "Untitled product") };
+  }
+
+  /** Live product copies of these catalogue photos. */
+  async attachmentsFor(fileIds: string[]): Promise<{ id: number; productId: string; mediaId: string | null }[]> {
+    if (!fileIds.length) return [];
+    const out: { id: number; productId: string; mediaId: string | null }[] = [];
+    for (let i = 0; i < fileIds.length; i += IN_CHUNK) {
+      const part = fileIds.slice(i, i + IN_CHUNK);
+      const { results } = await this.db
+        .prepare(`SELECT id, product_id, media_id FROM product_photos WHERE removed_at IS NULL AND file_id IN (${part.map(() => "?").join(",")})`)
+        .bind(...part)
+        .all<{ id: number; product_id: string; media_id: string | null }>();
+      out.push(...results.map((r) => ({ id: Number(r.id), productId: r.product_id, mediaId: r.media_id })));
+    }
+    return out;
+  }
+
+  async markAttachmentsRemoved(ids: number[], catalogue: string, user: string) {
+    if (!ids.length) return;
+    const t = now();
+    await this.db.batch(
+      ids.map((id) =>
+        this.db
+          .prepare(`UPDATE product_photos SET removed_at = ?, removed_by = ?, removed_reason = 'catalogue_removed', removed_catalogue = ? WHERE id = ?`)
+          .bind(t, user, catalogue, id),
+      ),
+    );
+  }
+
+  /** Products that lost photos when a catalogue was removed, and haven't had new ones since. */
+  async strippedProducts(): Promise<{ productId: string; title: string; catalogue: string; removedAt: string }[]> {
+    await this.ready();
+    const { results } = await this.db
+      .prepare(
+        `SELECT r.product_id, MAX(r.product_title) AS title, MAX(r.removed_catalogue) AS catalogue, MAX(r.removed_at) AS removed_at
+         FROM product_photos r
+         WHERE r.removed_reason = 'catalogue_removed'
+           AND NOT EXISTS (SELECT 1 FROM product_photos a WHERE a.product_id = r.product_id AND a.removed_at IS NULL AND a.attached_at > r.removed_at)
+           AND NOT EXISTS (SELECT 1 FROM product_photos d WHERE d.product_id = r.product_id AND d.removed_reason = 'product_deleted')
+         GROUP BY r.product_id ORDER BY MAX(r.removed_at) DESC LIMIT 500`,
+      )
+      .all<{ product_id: string; title: string | null; catalogue: string; removed_at: string }>();
+    return results.map((r) => ({ productId: r.product_id, title: r.title ?? "", catalogue: r.catalogue, removedAt: r.removed_at }));
+  }
+
+  /** Remove a catalogue upload from the list, once it's undone and its photos are gone. */
+  async removeUpload(code: string): Promise<void> {
+    await this.ready();
+    const up = await this.row(code);
+    if (!up) throw new StoreError("Catalogue upload not found.", 404);
+    if (!up.undone_at) throw new StoreError("Remove its photos first.", 409, "not_undone");
+    if ((await this.undoRemaining(up.id)) > 0) throw new StoreError("Some of its photos are still being deleted. Try again.", 409, "undo_unfinished");
+    await this.db.batch([
+      this.db.prepare(`DELETE FROM catalogue_photos WHERE item_id IN (SELECT id FROM catalogue_items WHERE upload_id = ?)`).bind(up.id),
+      this.db.prepare(`DELETE FROM catalogue_items WHERE upload_id = ?`).bind(up.id),
+      this.db.prepare(`DELETE FROM catalogue_files WHERE upload_id = ? AND (status = 'deleted' OR file_id NOT LIKE 'gid:%')`).bind(up.id),
+      this.db.prepare(`DELETE FROM catalogue_uploads WHERE id = ?`).bind(up.id),
+    ]);
+  }
+
   /**
    * Undo an upload: it stops matching straight away, and its photos are queued for deletion from Shopify
    * Files. Photos that a newer, still-active upload also uses are handed over to that upload and kept.
@@ -544,7 +747,8 @@ export class CatalogueStore {
 
   async markFilesDeleted(fileIds: string[]) {
     if (!fileIds.length) return;
-    await this.db.batch(fileIds.map((id) => this.db.prepare(`UPDATE catalogue_files SET status = 'deleted' WHERE file_id = ?`).bind(id)));
+    // Gone from Shopify, so the fingerprint is freed for the same picture to be uploaded again later.
+    await this.db.batch(fileIds.map((id) => this.db.prepare(`UPDATE catalogue_files SET status = 'deleted', fingerprint = NULL WHERE file_id = ?`).bind(id)));
   }
 
   /** Catalogue uploads (not undone) per supplier, keyed by supplierMatchKey. */

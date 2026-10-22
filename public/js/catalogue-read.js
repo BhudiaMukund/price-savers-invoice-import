@@ -3,6 +3,7 @@
 // Pure functions, no DOM: the page passes in SheetJS and an unzip function, and the tests do the same.
 
 import { analyzeBarcode } from "./barcode.js";
+import { isOle, xlsPictures } from "./xls-pictures.js";
 
 export const PHOTO_EXT = /\.(jpe?g|png|gif|webp)$/i;
 const OTHER_PICTURE_EXT = /\.(emf|wmf|tiff?|bmp|svg|heic|heif)$/i;
@@ -14,6 +15,7 @@ let nextId = 0;
 const photoOf = (name, bytes, ext) => ({ id: `p${++nextId}`, name, bytes, type: MIME[ext.toLowerCase()] });
 const extOf = (name) => (name.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? "").toLowerCase();
 const baseName = (p) => p.split("/").pop();
+const plural = (n, one) => `${n} ${n === 1 ? one : `${one}s`}`;
 
 /* ------------------------------------------------------------------ tiny XML helpers (Excel's XML is regular) */
 
@@ -221,7 +223,7 @@ function richValueImages(zip) {
  * { sheets: [{ name, grid: string[][], links: Map("r:c" -> url) }], pictures: { [sheet]: [...] },
  *   loose: [photo], unsupported, fileNames, problems: [string] }
  */
-export async function readCatalogueFiles(files, { XLSX, unzip, zip }) {
+export async function readCatalogueFiles(files, { XLSX, unzip, zip, toPng }) {
   const out = { sheets: [], pictures: {}, loose: [], unsupported: 0, fileNames: [], problems: [] };
   const entries = []; // { name, bytes }
   for (const f of files) {
@@ -242,19 +244,20 @@ export async function readCatalogueFiles(files, { XLSX, unzip, zip }) {
     } else entries.push({ name: f.name, bytes });
   }
 
-  let sheetFile = null;
+  // Every spreadsheet is read: a supplier's portal often exports one file per page of its range. Their sheets
+  // are told apart by file name, and products appearing in several are merged later (by barcode or code).
+  const sheetFiles = [];
   for (const e of entries) {
-    if (SHEET_EXT.test(e.name)) {
-      if (sheetFile) {
-        out.problems.push(`Only one spreadsheet is read at a time, so ${baseName(e.name)} was left out.`);
-        continue;
-      }
-      sheetFile = e;
-    } else if (PHOTO_EXT.test(e.name)) out.loose.push(photoOf(baseName(e.name), e.bytes, extOf(e.name)));
+    if (SHEET_EXT.test(e.name)) sheetFiles.push(e);
+    else if (PHOTO_EXT.test(e.name)) out.loose.push(photoOf(baseName(e.name), e.bytes, extOf(e.name)));
     else if (OTHER_PICTURE_EXT.test(e.name)) out.unsupported++;
   }
-
-  if (sheetFile) {
+  const many = sheetFiles.length > 1;
+  out.sheetFiles = sheetFiles.length;
+  const unreadable = [];
+  let noPictures = 0;
+  for (const sheetFile of sheetFiles) {
+    const label = (sheet) => (many ? `${baseName(sheetFile.name)} › ${sheet}` : sheet);
     // .xlsx is a ZIP. Open it once: the pictures come from here, and the Excel reader gets a copy without
     // them (it would otherwise unpack every photo just to read the text, which is slow on big catalogues).
     let parts = null;
@@ -263,6 +266,15 @@ export async function readCatalogueFiles(files, { XLSX, unzip, zip }) {
         parts = unzip(sheetFile.bytes);
       } catch {
         parts = null;
+      }
+    }
+    // An old .xls: its pictures are read straight from the file (SheetJS only reads the cells).
+    let xlsPics = null;
+    if (!parts && isOle(sheetFile.bytes)) {
+      try {
+        xlsPics = xlsPictures(sheetFile.bytes);
+      } catch {
+        noPictures++;
       }
     }
     let wb;
@@ -276,46 +288,77 @@ export async function readCatalogueFiles(files, { XLSX, unzip, zip }) {
         sheetFile.bytes = null; // the unpacked parts are all that's needed now: let the browser free the file
       } else {
         wb = XLSX.read(sheetFile.bytes, { type: "array", cellDates: true });
+        sheetFile.bytes = null;
       }
     } catch {
-      out.problems.push(`${baseName(sheetFile.name)} couldn't be opened. Save it again from Excel and retry.`);
-      wb = null;
+      unreadable.push(baseName(sheetFile.name));
+      continue;
     }
-    if (wb) {
-      for (const name of wb.SheetNames) {
-        const ws = wb.Sheets[name];
-        if (!ws?.["!ref"]) continue;
-        const range = XLSX.utils.decode_range(ws["!ref"]);
-        // Start at A1 so row/column numbers match the sheet (and the picture anchors).
-        const grid = XLSX.utils.sheet_to_json(ws, {
-          header: 1,
-          raw: false,
-          rawNumbers: true,
-          defval: "",
-          blankrows: true,
-          range: { s: { r: 0, c: 0 }, e: range.e },
-        });
-        const links = new Map();
-        for (const [addr, cell] of Object.entries(ws)) {
-          if (addr[0] === "!" || !cell?.l?.Target) continue;
-          const at = cellRef(addr);
-          if (at && /^https?:/i.test(cell.l.Target)) links.set(`${at.row}:${at.col}`, cell.l.Target);
-        }
-        if (grid.some((r) => r.some((v) => String(v).trim()))) out.sheets.push({ name, grid: grid.map((r) => r.map((v) => String(v ?? "").trim())), links });
+    for (const name of wb.SheetNames) {
+      const ws = wb.Sheets[name];
+      if (!ws?.["!ref"]) continue;
+      const range = XLSX.utils.decode_range(ws["!ref"]);
+      // Start at A1 so row/column numbers match the sheet (and the picture anchors).
+      const grid = XLSX.utils.sheet_to_json(ws, {
+        header: 1,
+        raw: false,
+        rawNumbers: true,
+        defval: "",
+        blankrows: true,
+        range: { s: { r: 0, c: 0 }, e: range.e },
+      });
+      const links = new Map();
+      for (const [addr, cell] of Object.entries(ws)) {
+        if (addr[0] === "!" || !cell?.l?.Target) continue;
+        const at = cellRef(addr);
+        if (at && /^https?:/i.test(cell.l.Target)) links.set(`${at.row}:${at.col}`, cell.l.Target);
       }
-      if (parts) {
-        try {
-          const pics = xlsxPictures(parts);
-          out.pictures = pics.bySheet;
-          out.unsupported += pics.unsupported;
-        } catch {
-          out.problems.push("The pictures inside the spreadsheet couldn't be read.");
-        }
-      } else if (/\.(xlsx|xlsm)$/i.test(sheetFile.name)) {
-        out.problems.push("The pictures inside the spreadsheet couldn't be read.");
+      if (grid.some((r) => r.some((v) => String(v).trim()))) {
+        out.sheets.push({ name: label(name), file: baseName(sheetFile.name), grid: grid.map((r) => r.map((v) => String(v ?? "").trim())), links });
       }
     }
+    if (xlsPics) {
+      const shared = new Map(); // one photo per picture, however many rows use it
+      let n = 0;
+      for (const [sheet, list] of Object.entries(xlsPics.bySheet)) {
+        const placed = [];
+        for (const p of list) {
+          let photo = shared.get(p.pic.index);
+          if (photo === undefined) {
+            let { ext, bytes } = p.pic;
+            // Bitmaps are turned into PNG by the page (browsers can't send a BMP to Shopify as it is).
+            if (ext === "bmp") {
+              const png = toPng ? await toPng(bytes).catch(() => null) : null;
+              if (png) (ext = "png"), (bytes = png);
+              else ext = "";
+            }
+            photo = ext ? photoOf(`image${++n}.${ext}`, bytes, ext) : null;
+            shared.set(p.pic.index, photo);
+            if (!photo) out.unsupported++;
+          }
+          if (photo) placed.push({ row: p.row, col: p.col, rows: p.rows, photo });
+        }
+        if (placed.length) out.pictures[label(sheet)] = placed;
+      }
+      out.unsupported += xlsPics.unsupported;
+    } else if (parts) {
+      try {
+        const pics = xlsxPictures(parts);
+        for (const [sheet, list] of Object.entries(pics.bySheet)) out.pictures[label(sheet)] = list;
+        out.unsupported += pics.unsupported;
+      } catch {
+        noPictures++;
+      }
+    } else if (/\.(xlsx|xlsm)$/i.test(sheetFile.name)) noPictures++;
   }
+  if (unreadable.length) {
+    out.problems.push(
+      unreadable.length === 1
+        ? `${unreadable[0]} couldn't be opened. Save it again from Excel and retry.`
+        : `${unreadable.length} files couldn't be opened (${unreadable.slice(0, 3).join(", ")}${unreadable.length > 3 ? "…" : ""}). Save them again from Excel and retry.`,
+    );
+  }
+  if (noPictures) out.problems.push(noPictures === 1 && !many ? "The pictures inside the spreadsheet couldn't be read." : `The pictures inside ${plural(noPictures, "spreadsheet")} couldn't be read.`);
   return out;
 }
 
@@ -372,17 +415,65 @@ export function guessMap(read) {
   };
 }
 
+const IMAGE_LINK = /\.(jpe?g|png|gif|webp)(\?|#|$)|\/(images?|photos?|pictures?|img|media|uploads?|cdn)\b|[?&](image|photo|img)=/i;
+
+/**
+ * Photo links in columns that have no heading (or one the headings guess missed): a column where most product
+ * rows have a link that looks like a picture, often with words on it like "Click to preview".
+ * Returns the map with those columns added to photoLinks (the same map when there are none).
+ */
+export function withLinkColumns(read, map) {
+  const sheet = map && read.sheets.find((s) => s.name === map.sheet);
+  if (!sheet) return map;
+  const colIdx = (L) => (L ? cellRef(`${L}1`).col : -1);
+  const c = map.columns;
+  const taken = new Set([c.barcode, c.supplierCode, c.title, c.description, ...(c.photoLinks ?? [])].map(colIdx));
+  const [bi, ci] = [colIdx(c.barcode), colIdx(c.supplierCode)];
+  const start = map.headerRow ?? 0;
+  let products = 0;
+  const found = new Map(); // column -> { n, urls: Set, pictures }
+  for (let r = start; r < sheet.grid.length; r++) {
+    const row = sheet.grid[r];
+    if (!(bi >= 0 && row[bi]) && !(ci >= 0 && row[ci])) continue;
+    products++;
+    for (let col = 0; col < row.length; col++) {
+      if (taken.has(col)) continue;
+      const url = sheet.links.get(`${r}:${col}`) ?? (/^https?:\/\/\S+$/i.test(row[col] ?? "") ? row[col] : null);
+      if (!url || !/^https?:/i.test(url)) continue;
+      const f = found.get(col) ?? { n: 0, urls: new Set(), pictures: 0 };
+      f.n++;
+      f.urls.add(url);
+      if (IMAGE_LINK.test(url)) f.pictures++;
+      found.set(col, f);
+    }
+  }
+  const added = [...found]
+    .filter(([, f]) => f.n >= Math.max(2, products * 0.4) && f.urls.size >= f.n * 0.5 && f.pictures >= f.n * 0.5)
+    .map(([col]) => colLetter(col))
+    .sort((a, b) => colIdx(a) - colIdx(b));
+  if (!added.length) return map;
+  return { ...map, columns: { ...c, photoLinks: [...(c.photoLinks ?? []), ...added].slice(0, 4) } };
+}
+
 /** The first rows of each sheet, as text for the AI to work out the layout. */
 export function buildSample(read, maxRows = 30) {
   const parts = [];
-  for (const sheet of read.sheets.slice(0, 4)) {
+  const seen = new Set();
+  for (const sheet of read.sheets) {
+    if (parts.length >= 4) break;
+    // One sample per layout: 22 exports of the same report would all look alike.
+    // (the first row with a few cells filled: the headings, past any title above them)
+    const firstRow = (sheet.grid.find((r) => r.filter(Boolean).length >= 3) ?? sheet.grid.find((r) => r.some(Boolean)) ?? []).join("|");
+    if (seen.has(firstRow)) continue;
+    seen.add(firstRow);
     const lines = [];
     for (let r = 0; r < sheet.grid.length && lines.length < maxRows; r++) {
       const cells = sheet.grid[r]
         .map((v, c) => {
           const link = sheet.links.get(`${r}:${c}`);
-          const val = v || (link ? link : "");
-          return val ? `${colLetter(c)}=${val.replace(/\s+/g, " ").slice(0, 60)}` : null;
+          // A link with words on it ("Click to preview") is shown with its address, so the AI can tell it's a photo link.
+          const val = link && v && v !== link ? `${v.slice(0, 24)} <${link.slice(0, 90)}>` : v || link || "";
+          return val ? `${colLetter(c)}=${val.replace(/\s+/g, " ").slice(0, link ? 130 : 60)}` : null;
         })
         .filter(Boolean);
       if (cells.length) lines.push(`Row ${r + 1}: ${cells.join(" | ")}`);
@@ -405,6 +496,16 @@ const keyOf = (barcode, code) => {
   const ck = String(code ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   return ck ? `c:${ck}` : null;
 };
+
+/**
+ * How many different pictures a product has. A sheet often shows the picture and also links to it ("Click to
+ * preview"), so a picture and a link on the same product count once: the two are compared once Shopify has the link.
+ */
+export function pictureCount(item) {
+  const photos = item.backup ?? item.photos;
+  const { links } = item;
+  return photos.length && links.length ? Math.max(photos.length, links.length) : photos.length + links.length;
+}
 
 /**
  * Turn the rows into products using the chosen columns. Rows for the same barcode or code are merged
@@ -433,14 +534,38 @@ export function buildItems(read, map) {
     return it;
   };
 
-  const rowItem = new Map(); // sheet row -> item
+  // The chosen sheet, plus every other sheet with the same headings (one export split into several files or
+  // tabs). Without a headings row, the first sheet of each other file is read the same way.
+  const parts = [];
   if (sheet) {
+    parts.push({ sheet, start: map.headerRow ?? 0 });
     const c = map.columns;
-    const [bi, ci, ti, di] = [colIdx(c.barcode), colIdx(c.supplierCode), colIdx(c.title), colIdx(c.description)];
-    const li = (c.photoLinks ?? []).map(colIdx);
-    const start = map.headerRow ?? 0; // headerRow is 1-based, so this is the first row after it
-    for (let r = start; r < sheet.grid.length; r++) {
-      const row = sheet.grid[r];
+    const idx = [c.barcode, c.supplierCode, c.title].map(colIdx);
+    const headOf = (row) => idx.map((i) => (i >= 0 ? String(row?.[i] ?? "").toLowerCase() : "")).join("|");
+    const head = map.headerRow ? headOf(sheet.grid[map.headerRow - 1]) : null;
+    const firstOfFile = new Set();
+    for (const s of read.sheets) {
+      if (s === sheet) continue;
+      if (head && head.replace(/\|/g, "")) {
+        const at = s.grid.slice(0, 40).findIndex((row) => headOf(row) === head);
+        if (at >= 0) parts.push({ sheet: s, start: at + 1 });
+      } else if (!map.headerRow && s.file && s.file !== sheet.file && !firstOfFile.has(s.file)) {
+        firstOfFile.add(s.file);
+        parts.push({ sheet: s, start: 0 });
+      }
+    }
+  }
+  stats.sheets = parts.length;
+  stats.files = new Set(parts.map((p) => p.sheet.file).filter(Boolean)).size;
+
+  const c = map?.columns ?? {};
+  const [bi, ci, ti, di] = [colIdx(c.barcode), colIdx(c.supplierCode), colIdx(c.title), colIdx(c.description)];
+  const li = (c.photoLinks ?? []).map(colIdx);
+  const used = new Set(parts.map((p) => p.sheet.name));
+  for (const { sheet: sh, start } of parts) {
+    const rowItem = new Map(); // sheet row -> item
+    for (let r = start; r < sh.grid.length; r++) {
+      const row = sh.grid[r];
       if (!row.some(Boolean)) continue;
       stats.rows++;
       const barcode = bi >= 0 ? row[bi] ?? "" : "";
@@ -455,12 +580,12 @@ export function buildItems(read, map) {
       if (!it.title && ti >= 0) it.title = row[ti] ?? "";
       if (!it.description && di >= 0) it.description = row[di] ?? "";
       for (const i of li) {
-        const vals = [sheet.links.get(`${r}:${i}`), ...(row[i] ?? "").split(/[\s,;|]+/)].filter((v) => v && /^https?:\/\/\S+$/i.test(v));
+        const vals = [sh.links.get(`${r}:${i}`), ...(row[i] ?? "").split(/[\s,;|]+/)].filter((v) => v && /^https?:\/\/\S+$/i.test(v));
         for (const url of vals) if (!it.links.includes(url)) it.links.push(url);
       }
     }
     // Pictures: on the row holding most of the picture (or the next-most, if that row has no product).
-    for (const pic of read.pictures[sheet.name] ?? []) {
+    for (const pic of read.pictures[sh.name] ?? []) {
       stats.photos++;
       let it = null;
       for (const r of pic.rows) if (!it) it = rowItem.get(r) ?? null;
@@ -470,9 +595,9 @@ export function buildItems(read, map) {
       }
       if (!it.photos.includes(pic.photo)) it.photos.push(pic.photo);
     }
-    // Pictures on other sheets can't be tied to a row.
-    for (const [name, pics] of Object.entries(read.pictures)) if (name !== sheet.name) (stats.photos += pics.length), (stats.unplaced += pics.length);
   }
+  // Pictures on sheets that weren't read can't be tied to a row.
+  for (const [name, pics] of Object.entries(read.pictures)) if (!used.has(name)) (stats.photos += pics.length), (stats.unplaced += pics.length);
 
   // Loose photo files, named like HN-7701.jpg, HN-7701_2.jpg, 9399111770133 back.jpg
   const known = new Map();
@@ -534,11 +659,55 @@ export function buildItems(read, map) {
   placed.sort((a, b) => a.order - b.order || a.photo.name.localeCompare(b.photo.name));
   for (const p of placed) if (!p.target.photos.includes(p.photo)) p.target.photos.push(p.photo);
 
+  // The same picture twice on one product: identical files (a sheet that has it on two rows, or a picture and
+  // its copy) and the same link written two ways (http/https, capitals, a changed query) are kept once.
+  const linkKey = (u) => {
+    try {
+      const x = new URL(u);
+      return `${x.hostname.replace(/^www\./i, "")}${decodeURIComponent(x.pathname)}`.toLowerCase();
+    } catch {
+      return u.toLowerCase();
+    }
+  };
+  for (const it of items) {
+    const seen = new Set();
+    it.photos = it.photos.filter((p) => {
+      const k = sameBytesKey(p.bytes);
+      return seen.has(k) ? false : (seen.add(k), true);
+    });
+    const links = new Set();
+    it.links = it.links.filter((u) => {
+      const k = linkKey(u);
+      return links.has(k) ? false : (links.add(k), true);
+    });
+  }
+
+  // A picture in the sheet beside a link to a picture ("Click to preview" next to a thumbnail) is the same
+  // photo, and the link is the full-size one. The link is used; the sheet's picture is kept as a spare for if
+  // the links turn out not to work (the page checks a few before saving).
+  for (const it of items) {
+    if (it.photos.length && it.links.length && it.photos.length <= it.links.length) {
+      it.backup = it.photos;
+      it.photos = [];
+    }
+  }
+
   for (const it of items) {
     stats.links += it.links.length;
-    it.mixed = it.photos.length + it.links.length > 1 && ASSORTED.test(`${it.title} ${it.description}`);
+    it.mixed = pictureCount(it) > 1 && ASSORTED.test(`${it.title} ${it.description}`);
   }
   return { items, stats };
+}
+
+/** Two cheap hashes and the length: enough to tell identical pictures apart from different ones, with no waiting. */
+function sameBytesKey(bytes) {
+  let a = 0x811c9dc5;
+  let b = 5381;
+  for (let i = 0; i < bytes.length; i++) {
+    a = Math.imul(a ^ bytes[i], 0x01000193) >>> 0;
+    b = (Math.imul(b, 33) + bytes[i]) >>> 0;
+  }
+  return `${bytes.length}:${a}:${b}`;
 }
 
 /** SHA-256 of a photo's bytes, so the same picture is only stored once. */

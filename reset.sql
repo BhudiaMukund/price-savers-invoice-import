@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS stock_changes;
+DROP TABLE IF EXISTS imported_products;
+DROP TABLE IF EXISTS runs;
+DROP TABLE IF EXISTS product_photos;
+DROP TABLE IF EXISTS catalogue_photos;
+DROP TABLE IF EXISTS catalogue_files;
+DROP TABLE IF EXISTS catalogue_items;
+DROP TABLE IF EXISTS catalogue_uploads;
+DROP TABLE IF EXISTS settings;

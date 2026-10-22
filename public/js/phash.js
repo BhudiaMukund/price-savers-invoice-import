@@ -148,3 +148,13 @@ export function maybeSame(a, b) {
   const d = distance(a, b);
   return d.ratio <= LIMITS.ratio && d.colour <= 12 && d.bits <= 80;
 }
+
+/**
+ * Two photos on the same product: the same picture can be stretched to fit a spreadsheet cell, so the
+ * proportions aren't compared (the close pixel comparison, which works on squared-up thumbnails, still decides).
+ */
+export function maybeSameProduct(a, b) {
+  if (!a || !b) return false;
+  const d = distance(a, b);
+  return d.ratio <= 0.4 && d.colour <= 14 && d.bits <= 90;
+}

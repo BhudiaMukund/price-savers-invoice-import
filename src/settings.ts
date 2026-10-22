@@ -12,13 +12,17 @@ export interface Settings {
   cataloguePhotos: boolean;
   /** Add the catalogue's description to new products by default. */
   catalogueDescriptions: boolean;
+  /** The Shopify location that receives stock from invoice quantities. Empty: the store's first active location.
+   *  Whether a run updates stock is chosen per run on the import screen, not here. */
+  stockLocationId: string;
 }
 
 export function defaultSettings(env: Env): Settings {
-  return { importTags: env.IMPORT_TAGS !== "false", cataloguePhotos: true, catalogueDescriptions: true };
+  return { importTags: env.IMPORT_TAGS !== "false", cataloguePhotos: true, catalogueDescriptions: true, stockLocationId: "" };
 }
 
-const KEYS = ["importTags", "cataloguePhotos", "catalogueDescriptions"] as const;
+const KEYS = ["importTags", "cataloguePhotos", "catalogueDescriptions", "stockLocationId"] as const;
+const LOCATION_RE = /^gid:\/\/shopify\/Location\/\d+$/;
 
 export function admins(env: Env): string[] {
   return (env.ADMIN_EMAILS ?? "")
@@ -42,7 +46,9 @@ export async function readSettings(env: Env): Promise<Settings> {
     if (!(KEYS as readonly string[]).includes(r.key)) continue;
     try {
       const v = JSON.parse(r.value);
-      if (typeof v === "boolean") (out as unknown as Record<string, boolean>)[r.key] = v;
+      if (r.key === "stockLocationId") {
+        if (typeof v === "string" && (v === "" || LOCATION_RE.test(v))) out.stockLocationId = v;
+      } else if (typeof v === "boolean") (out as unknown as Record<string, boolean>)[r.key] = v;
     } catch {
       /* ignore a broken value: the default stands */
     }
@@ -56,7 +62,9 @@ export async function writeSettings(db: Db, changes: Record<string, unknown>, us
   const stmts = [];
   for (const [key, value] of Object.entries(changes)) {
     if (!(KEYS as readonly string[]).includes(key)) throw new StoreError(`Unknown setting "${key}".`, 400);
-    if (typeof value !== "boolean") throw new StoreError(`"${key}" must be on or off.`, 400);
+    if (key === "stockLocationId") {
+      if (typeof value !== "string" || (value !== "" && !LOCATION_RE.test(value))) throw new StoreError("Choose one of the store's locations.", 400);
+    } else if (typeof value !== "boolean") throw new StoreError(`"${key}" must be on or off.`, 400);
     stmts.push(
       db
         .prepare(`INSERT INTO settings (key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)

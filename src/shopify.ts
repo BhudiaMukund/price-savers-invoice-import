@@ -1,5 +1,5 @@
 import type { Env, StoreProduct } from "./types";
-import { searchForms } from "./barcode";
+import { analyzeBarcode, searchForms } from "./barcode";
 
 interface GqlResponse<T> {
   data?: T;
@@ -106,13 +106,13 @@ export async function fetchStoreProducts(env: Env): Promise<StoreProduct[]> {
     query Variants($cursor: String) {
       productVariants(first: 250, after: $cursor) {
         pageInfo { hasNextPage endCursor }
-        nodes { barcode sku product { id title handle } }
+        nodes { barcode sku product { id title handle status } }
       }
     }`;
   type R = {
     productVariants: {
       pageInfo: { hasNextPage: boolean; endCursor: string | null };
-      nodes: { barcode: string | null; sku: string | null; product: { id: string; title: string; handle: string } }[];
+      nodes: { barcode: string | null; sku: string | null; product: { id: string; title: string; handle: string; status?: StoreProduct["status"] } }[];
     };
   };
   for (let page = 0; page < 200; page++) {
@@ -124,6 +124,7 @@ export async function fetchStoreProducts(env: Env): Promise<StoreProduct[]> {
         handle: v.product.handle,
         barcode: v.barcode ?? "",
         sku: v.sku ?? "",
+        status: v.product.status,
       });
     }
     if (!data.productVariants.pageInfo.hasNextPage) break;
@@ -146,7 +147,7 @@ export async function findVariantsByBarcodes(env: Env, barcodes: (string | null 
   const out: StoreProduct[] = [];
   type R = {
     productVariants: {
-      nodes: { barcode: string | null; sku: string | null; product: { id: string; title: string; handle: string } }[];
+      nodes: { barcode: string | null; sku: string | null; product: { id: string; title: string; handle: string; status?: StoreProduct["status"] } }[];
     };
   };
   // Keep each search query short.
@@ -154,12 +155,12 @@ export async function findVariantsByBarcodes(env: Env, barcodes: (string | null 
     const data = await gql<R>(
       env,
       `query Find($q: String!) {
-         productVariants(first: 250, query: $q) { nodes { barcode sku product { id title handle } } }
+         productVariants(first: 250, query: $q) { nodes { barcode sku product { id title handle status } } }
        }`,
       { q: terms.slice(i, i + 40).join(" OR ") },
     );
     for (const v of data.productVariants.nodes) {
-      out.push({ productId: v.product.id, title: v.product.title, handle: v.product.handle, barcode: v.barcode ?? "", sku: v.sku ?? "" });
+      out.push({ productId: v.product.id, title: v.product.title, handle: v.product.handle, barcode: v.barcode ?? "", sku: v.sku ?? "", status: v.product.status });
     }
   }
   return out;
@@ -230,15 +231,17 @@ export interface NewProduct {
   /** The run (working session) it was added in, e.g. R42. */
   runCode: string | null;
   /** Catalogue photos (Shopify CDN addresses), main photo first. The product gets its own copies. */
-  photos?: { url: string; alt: string }[];
+  photos?: { url: string; alt: string; filename?: string }[];
   /** Description from the supplier catalogue, plain text. */
   description?: string | null;
   /** Add the import-<ID> and run-<code> tags (the "Tag new products" setting). Default on. */
   tags?: boolean;
+  /** Start with this much stock at this location, with stock tracking turned on. */
+  stock?: { quantity: number; locationId: string };
 }
 
 export type CreateResult =
-  | { ok: true; productId: string; published: boolean; photos: number; photoError?: string }
+  | { ok: true; productId: string; published: boolean; photos: number; photoError?: string; mediaIds: string[] }
   | { ok: false; error: string };
 
 /** Plain text to safe HTML paragraphs. */
@@ -261,7 +264,7 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
   const mutation = `
     mutation Create($input: ProductSetInput!) {
       productSet(synchronous: true, input: $input) {
-        product { id }
+        product { id media(first: 20) { nodes { id } } }
         userErrors { field message code }
       }
     }`;
@@ -271,10 +274,15 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
     // In-store only: no stock counting, and not shippable (so it can never be sent in an online order).
     inventoryItem: { tracked: false, requiresShipping: false },
   };
+  if (p.stock && p.stock.quantity > 0) {
+    // Counted stock: tracking on, and the invoice quantity as the starting count at the chosen location.
+    variant.inventoryItem = { tracked: true, requiresShipping: false };
+    variant.inventoryQuantities = [{ locationId: p.stock.locationId, name: "available", quantity: Math.floor(p.stock.quantity) }];
+  }
   if (p.barcode) variant.barcode = p.barcode;
   if (p.sku) variant.sku = p.sku;
 
-  type R = { productSet: { product: { id: string } | null; userErrors: { field: string[] | null; message: string }[] } };
+  type R = { productSet: { product: { id: string; media?: { nodes: { id: string }[] } } | null; userErrors: { field: string[] | null; message: string }[] } };
   try {
     const input: Record<string, unknown> = {
       title: p.title,
@@ -286,7 +294,9 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
     if (p.description?.trim()) input.descriptionHtml = textToHtml(p.description);
     const photos = (p.photos ?? []).slice(0, 12);
     // Copies made from the catalogue's photo (Shopify downloads it from its own CDN), not links to it.
-    if (photos.length) input.files = photos.map((ph) => ({ originalSource: ph.url, contentType: "IMAGE", alt: ph.alt.slice(0, 500) }));
+    if (photos.length) {
+      input.files = photos.map((ph) => ({ originalSource: ph.url, contentType: "IMAGE", alt: ph.alt.slice(0, 500), ...(ph.filename ? { filename: ph.filename } : {}) }));
+    }
     if (p.importId) {
       const f = ctx.importSource;
       input.metafields = [{ namespace: f.namespace, key: f.key, type: f.type, value: importSourceValue(f.type, p.importId) }];
@@ -294,8 +304,14 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
     }
     let data = await gql<R>(env, mutation, { input });
     let photoError: string | undefined;
-    // A photo problem shouldn't stop the product being added: try again without the photos.
-    if (input.files && data.productSet.userErrors.some((e) => (e.field ?? []).includes("files"))) {
+    const filesError = () => data.productSet.userErrors.some((e) => (e.field ?? []).includes("files"));
+    // A photo problem shouldn't stop the product being added: try again with Shopify's own file names,
+    // then without the photos.
+    if (input.files && filesError() && photos.some((ph) => ph.filename)) {
+      input.files = photos.map((ph) => ({ originalSource: ph.url, contentType: "IMAGE", alt: ph.alt.slice(0, 500) }));
+      data = await gql<R>(env, mutation, { input });
+    }
+    if (input.files && filesError()) {
       photoError = data.productSet.userErrors.map((e) => e.message).join("; ");
       delete input.files;
       data = await gql<R>(env, mutation, { input });
@@ -317,7 +333,9 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
       );
       published = pub.publishablePublish.userErrors.length === 0;
     }
-    return { ok: true, productId: product.id, published, photos: input.files ? photos.length : 0, ...(photoError ? { photoError } : {}) };
+    // The product's own photo copies, in the order the photos were sent (one per catalogue photo).
+    const mediaIds = input.files ? (product.media?.nodes ?? []).map((m) => m.id).slice(0, photos.length) : [];
+    return { ok: true, productId: product.id, published, photos: input.files ? photos.length : 0, mediaIds, ...(photoError ? { photoError } : {}) };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
@@ -464,6 +482,171 @@ export async function removeSupplier(env: Env, name: string): Promise<string[]> 
     throw new ShopifyError(`Couldn't update the supplier list: ${res.metafieldsSet.userErrors.map((e) => e.message).join("; ")}`);
   }
   return mergeSuppliers(vendors, names);
+}
+
+/* ------------------------------------------------------------------ stock */
+
+export interface StockLocation {
+  id: string;
+  name: string;
+}
+
+/** The store's active stock locations, for the Settings page. */
+export async function listLocations(env: Env): Promise<StockLocation[]> {
+  const data = await gql<{ locations: { nodes: StockLocation[] } }>(env, `query { locations(first: 50, includeInactive: false) { nodes { id name } } }`);
+  return data.locations.nodes;
+}
+
+/** Say what to do when Shopify won't touch stock, instead of its terse "Access denied". */
+export function stockError(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (/access denied|read_inventory|write_inventory|read_locations|not approved|scope/i.test(msg)) {
+    return "The Shopify app can't change stock yet. Add the read_inventory, write_inventory and read_locations scopes to the app, release a new version and reinstall it (see the README).";
+  }
+  return msg;
+}
+
+export interface StockLine {
+  productId: string;
+  barcode: string | null;
+  /** Whole units to add (negative to take back out). */
+  qty: number;
+}
+
+export type StockResult = { ok: true; turnedOnTracking: boolean } | { ok: false; error: string };
+
+type UE = { field: string[] | null; message: string }[];
+
+/** Several mutations in one request: m0, m1, ... Returns each one's userErrors. */
+async function manyMutations(env: Env, calls: string[]): Promise<UE[]> {
+  if (!calls.length) return [];
+  const body = calls.map((c, i) => `m${i}: ${c}`).join("\n");
+  const data = await gql<Record<string, { userErrors: UE }>>(env, `mutation { ${body} }`);
+  return calls.map((_, i) => data[`m${i}`]?.userErrors ?? []);
+}
+
+export type ActivateResult = { ok: true; activated: boolean; published: boolean } | { ok: false; error: string };
+
+/**
+ * Make products that are in the store as DRAFT active, and put them on Point of Sale, the same as a product
+ * this tool creates. Only DRAFT products are touched: one that is already active, or was archived on purpose,
+ * is left alone (activated: false). Price, tags, shipping and everything else stay as they are.
+ * Subrequests: one to read the statuses, then one per 10 products to change them.
+ */
+export async function activateProducts(env: Env, ctx: ShopContext, productIds: string[]): Promise<ActivateResult[]> {
+  const out: ActivateResult[] = productIds.map(() => ({ ok: false, error: "Not attempted." }));
+  const ids = [...new Set(productIds)];
+  const data = await gql<{ nodes: ({ id: string; status: string } | null)[] }>(env, `query Status($ids: [ID!]!) { nodes(ids: $ids) { ... on Product { id status } } }`, { ids });
+  const status = new Map(data.nodes.filter((n): n is { id: string; status: string } => !!n?.id).map((n) => [n.id, n.status]));
+  const done = new Map<string, ActivateResult>();
+  const drafts: string[] = [];
+  for (const id of ids) {
+    const st = status.get(id);
+    if (!st) done.set(id, { ok: false, error: "That product wasn't found in the store." });
+    else if (st !== "DRAFT") done.set(id, { ok: true, activated: false, published: false });
+    else drafts.push(id);
+  }
+  for (let i = 0; i < drafts.length; i += 10) {
+    const group = drafts.slice(i, i + 10);
+    const calls: string[] = [];
+    for (const id of group) {
+      calls.push(`productUpdate(product: {id: "${id}", status: ACTIVE}) { userErrors { field message } }`);
+      if (ctx.posPublicationId) calls.push(`publishablePublish(id: "${id}", input: [{publicationId: "${ctx.posPublicationId}"}]) { userErrors { field message } }`);
+    }
+    try {
+      const errors = await manyMutations(env, calls);
+      const per = ctx.posPublicationId ? 2 : 1;
+      group.forEach((id, k) => {
+        const upd = errors[k * per] ?? [];
+        const pub = per === 2 ? (errors[k * per + 1] ?? []) : null;
+        if (upd.length) done.set(id, { ok: false, error: upd.map((e) => e.message).join("; ") });
+        else done.set(id, { ok: true, activated: true, published: !!pub && pub.length === 0 });
+      });
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      for (const id of group) done.set(id, { ok: false, error });
+    }
+  }
+  return productIds.map((id, i) => done.get(id) ?? out[i]!);
+}
+
+/**
+ * Add (or take back) stock on products that are already in the store. Stock tracking is turned on first if it
+ * was off, and the product is stocked at the location if it wasn't. Subrequests: one to read the products,
+ * one to turn tracking on and stock the location, one to adjust (or one per line if that has to fall back).
+ */
+export async function adjustStock(env: Env, locationId: string, lines: StockLine[], reason: "received" | "correction" = "received"): Promise<StockResult[]> {
+  type Var = { id: string; barcode: string | null; inventoryItem: { id: string; tracked: boolean; inventoryLevel: { id: string } | null } | null };
+  type Node = { id: string; variants: { nodes: Var[] } } | null;
+  const out: StockResult[] = lines.map(() => ({ ok: false, error: "Not attempted." }));
+  const ids = [...new Set(lines.map((l) => l.productId))];
+  const data = await gql<{ nodes: Node[] }>(
+    env,
+    `query Stock($ids: [ID!]!, $loc: ID!) {
+       nodes(ids: $ids) { ... on Product { id variants(first: 50) { nodes { id barcode inventoryItem { id tracked inventoryLevel(locationId: $loc) { id } } } } } }
+     }`,
+    { ids, loc: locationId },
+  );
+  const byProduct = new Map(ids.map((id, i) => [id, data.nodes[i]]));
+
+  const picked: { at: number; item: NonNullable<Var["inventoryItem"]> }[] = [];
+  lines.forEach((l, at) => {
+    const node = byProduct.get(l.productId);
+    if (!node) return void (out[at] = { ok: false, error: "That product is no longer in Shopify." });
+    const want = analyzeBarcode(l.barcode).key;
+    const variants = node.variants.nodes;
+    const v = (want && variants.find((x) => analyzeBarcode(x.barcode).key === want)) || (variants.length === 1 ? variants[0] : undefined);
+    if (!v?.inventoryItem) return void (out[at] = { ok: false, error: "Couldn't tell which variant of this product to stock." });
+    picked.push({ at, item: v.inventoryItem });
+  });
+
+  // Tracking on, and the location stocked, in one request.
+  const prep: string[] = [];
+  const prepFor: number[] = [];
+  const turnedOn = new Set<number>();
+  for (const { at, item } of picked) {
+    if (!item.tracked && lines[at]!.qty > 0) {
+      prep.push(`inventoryItemUpdate(id: ${JSON.stringify(item.id)}, input: { tracked: true }) { userErrors { field message } }`);
+      prepFor.push(at);
+      turnedOn.add(at);
+    }
+    if (!item.inventoryLevel) {
+      prep.push(`inventoryActivate(inventoryItemId: ${JSON.stringify(item.id)}, locationId: ${JSON.stringify(locationId)}) { userErrors { field message } }`);
+      prepFor.push(at);
+    }
+  }
+  const prepErrors = new Map<number, string>();
+  (await manyMutations(env, prep)).forEach((errs, k) => {
+    if (errs.length) prepErrors.set(prepFor[k]!, errs.map((e) => e.message).join("; "));
+  });
+  const ready = picked.filter((p) => {
+    const err = prepErrors.get(p.at);
+    if (err) out[p.at] = { ok: false, error: err };
+    return !err;
+  });
+  if (!ready.length) return out;
+
+  type Adj = { inventoryAdjustQuantities: { userErrors: UE } };
+  const adjust = (some: typeof ready) =>
+    gql<Adj>(
+      env,
+      `mutation Adj($input: InventoryAdjustQuantitiesInput!) { inventoryAdjustQuantities(input: $input) { userErrors { field message } } }`,
+      { input: { reason, name: "available", changes: some.map((p) => ({ delta: lines[p.at]!.qty, inventoryItemId: p.item.id, locationId })) } },
+    );
+  const done = (p: (typeof ready)[number]) => (out[p.at] = { ok: true, turnedOnTracking: turnedOn.has(p.at) });
+  const first = await adjust(ready);
+  if (!first.inventoryAdjustQuantities.userErrors.length) {
+    ready.forEach(done);
+    return out;
+  }
+  // Something in the batch was refused and nothing was changed: go line by line, so one bad line can't hold up the rest.
+  for (const p of ready) {
+    const res = await adjust([p]);
+    const errs = res.inventoryAdjustQuantities.userErrors;
+    if (errs.length) out[p.at] = { ok: false, error: errs.map((e) => e.message).join("; ") };
+    else done(p);
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ undo an import */

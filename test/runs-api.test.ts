@@ -16,6 +16,29 @@ const call = (method: string, path: string, body?: unknown) =>
     env,
   );
 
+describe("saving big runs cheaply", () => {
+  const put = (body: string) => app.fetch(new Request("http://x/api/runs/R1", { method: "PUT", headers: { "content-type": "application/json" }, body }), env);
+
+  it("stores the data as sent and sends it back as stored", async () => {
+    await call("POST", "/api/runs");
+    const rows = Array.from({ length: 2000 }, (_, i) => ({ id: `r${i}`, sourceId: "s1", title: `Product ${i}`, barcode: "9310720073156" }));
+    const data = JSON.stringify({ sources: [{ id: "s1", name: "big.csv" }], rows });
+    const res = await put(`{"version":1,"data":${data}}`);
+    expect(res.status).toBe(200);
+    const got: any = await (await call("GET", "/api/runs/R1")).json();
+    expect(got.run.version).toBe(2);
+    expect(got.run.productCount).toBe(2000);
+    expect(got.run.data.rows[1999]).toEqual(rows[1999]);
+  });
+
+  it("refuses bodies that aren't a version and data", async () => {
+    await call("POST", "/api/runs");
+    for (const body of ["", "{}", '{"data":{},"version":1}', '{"version":0,"data":{}}', '{"version":1,"data":}', '{"version":1,"data":[1,2]}', '{"version":1,"data":{oops}}']) {
+      expect([400, 413]).toContain((await put(body)).status);
+    }
+  });
+});
+
 describe("runs API", () => {
   it("creates a run for the signed-in person and opens it", async () => {
     const created: any = await (await call("POST", "/api/runs")).json();

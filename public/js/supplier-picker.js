@@ -79,7 +79,8 @@ export function supplierPicker({ id, value = "", placeholder = "Choose a supplie
     if (typed && !same && input.value !== committed) options.push({ kind: "new", name: typed });
     if (active >= options.length) active = Math.max(0, options.length - 1);
     const sameIdx = same ? options.findIndex((o) => o.name === same) : -1;
-    if (sameIdx >= 0 && input.value !== committed) active = sameIdx;
+    // A typed name that is a supplier (including retyping the current one) is what Enter picks.
+    if (sameIdx >= 0 && typed) active = sameIdx;
   }
 
   function paint() {

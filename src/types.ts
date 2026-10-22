@@ -24,11 +24,13 @@ export interface Env {
   IMPORT_SOURCE_METAFIELD?: string;
   /** "false" to stop adding an import-<ID> tag to products (the starting value of the setting). */
   IMPORT_TAGS?: string;
+  /** "false" to stop looking for bigger versions of catalogue photo links (thumbnails). On by default. */
+  PHOTO_UPGRADE?: string;
   /** Comma-separated emails of the people allowed to change settings and delete suppliers. Empty: everyone. */
   ADMIN_EMAILS?: string;
 }
 
-/** One line item as read from an invoice. Cost and quantity are deliberately not captured. */
+/** One line item as read from an invoice. Cost is deliberately not captured. */
 export interface ExtractedItem {
   /** Client-side row id, echoed back so results can be matched to rows. */
   id?: string;
@@ -38,6 +40,14 @@ export interface ExtractedItem {
   invoiceTitle?: string;
   supplierCode: string | null;
   barcode: string | null;
+  /** The quantity supplied on this line, as printed (not the quantity ordered). Null when there isn't one. */
+  quantity?: number | null;
+  /** What that quantity counts, as printed: "ea", "ctn", "doz"... Null when not stated. */
+  unit?: string | null;
+  /** How many single retail units (the thing with the barcode) one invoiced unit holds, when the invoice says. */
+  unitsPer?: number | null;
+  /** The AI couldn't tell whether the quantity counts single units or cartons/packs. */
+  qtyUnclear?: boolean;
 }
 
 /** What the AI reads from the invoice as a whole. */
@@ -56,7 +66,7 @@ export interface ReviewItem extends ExtractedItem {
   /** Leading zeros were restored (spreadsheets often drop them). */
   barcodeRepaired: boolean;
   match: "new" | "exists" | "duplicate_in_invoice";
-  existing?: { productId: string; title: string; handle: string };
+  existing?: { productId: string; title: string; handle: string; status?: "ACTIVE" | "DRAFT" | "ARCHIVED" };
 }
 
 export interface StoreProduct {
@@ -66,4 +76,6 @@ export interface StoreProduct {
   /** Raw barcode as stored in Shopify. */
   barcode: string;
   sku: string;
+  /** Shopify's product status. A DRAFT product is made ACTIVE when its invoice line is imported. */
+  status?: "ACTIVE" | "DRAFT" | "ARCHIVED";
 }

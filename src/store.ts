@@ -12,7 +12,7 @@
 /** The small part of D1 we use. Tests and demo mode pass an adapter over node:sqlite. */
 export interface Db {
   prepare(sql: string): Stmt;
-  batch(stmts: Stmt[]): Promise<unknown[]>;
+  batch(stmts: Stmt[]): Promise<{ meta: { changes?: number; last_row_id?: number } }[]>;
 }
 export interface Stmt {
   bind(...values: unknown[]): Stmt;
@@ -50,6 +50,23 @@ const SCHEMA = [
      deleted_at TEXT,
      deleted_by TEXT
    )`,
+  // Stock added from invoice quantities. dedupe_key (invoice + product) is what stops the same invoice adding
+  // its stock twice; it is cleared when the stock is taken back out, so the invoice can be added again.
+  `CREATE TABLE IF NOT EXISTS stock_changes (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     dedupe_key TEXT UNIQUE,
+     run_id INTEGER NOT NULL,
+     import_id TEXT NOT NULL,
+     product_id TEXT NOT NULL,
+     barcode TEXT,
+     qty INTEGER NOT NULL,
+     location_id TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     created_by TEXT,
+     created_at TEXT NOT NULL,
+     undone_at TEXT
+   )`,
+  `CREATE INDEX IF NOT EXISTS stock_by_import ON stock_changes(import_id)`,
   `CREATE INDEX IF NOT EXISTS imported_by_run ON imported_products(run_id)`,
   `CREATE INDEX IF NOT EXISTS imported_by_import ON imported_products(import_id)`,
   // Supplier catalogues: reference data only (nothing is created in Shopify except the photos, in Files).
@@ -100,6 +117,24 @@ const SCHEMA = [
      created_at TEXT NOT NULL
    )`,
   `CREATE INDEX IF NOT EXISTS cat_files_upload ON catalogue_files(upload_id, status)`,
+  // Which store products got a copy of which catalogue photo, so a catalogue in use can't be removed by
+  // accident, and products whose photos were removed can get new ones later.
+  `CREATE TABLE IF NOT EXISTS product_photos (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     product_id TEXT NOT NULL,
+     product_title TEXT,
+     media_id TEXT,
+     file_id TEXT NOT NULL,
+     source TEXT NOT NULL,
+     attached_at TEXT NOT NULL,
+     attached_by TEXT,
+     removed_at TEXT,
+     removed_by TEXT,
+     removed_reason TEXT,
+     removed_catalogue TEXT
+   )`,
+  `CREATE INDEX IF NOT EXISTS product_photos_file ON product_photos(file_id)`,
+  `CREATE INDEX IF NOT EXISTS product_photos_product ON product_photos(product_id)`,
   // Shared settings (the Settings page), one row per setting.
   `CREATE TABLE IF NOT EXISTS settings (
      key TEXT PRIMARY KEY,
@@ -275,6 +310,22 @@ export class RunStore {
     return this.db.prepare(`SELECT * FROM runs WHERE code = ?`).bind(code).first<RunRow>();
   }
 
+  /**
+   * A run with its saved data as the stored text, so a big run is sent back without being parsed and
+   * written out again (the free plan allows very little CPU per request).
+   */
+  async getRunText(code: string): Promise<{ detail: Omit<RunDetail, "data">; dataText: string } | null> {
+    await this.ready();
+    const r = await this.row(code);
+    if (!r) return null;
+    const live = await this.liveByInvoice(r.id);
+    const t = (r.data ?? "").trim();
+    return {
+      detail: { ...toSummary({ ...r, live: Object.values(live).reduce((a, b) => a + b, 0) }), version: r.version, liveByInvoice: live },
+      dataText: t.startsWith("{") && t.endsWith("}") ? t : "{}",
+    };
+  }
+
   async getRun(code: string): Promise<RunDetail | null> {
     await this.ready();
     const r = await this.row(code);
@@ -315,7 +366,7 @@ export class RunStore {
     } catch {
       throw new StoreError("The run data couldn't be read.", 400);
     }
-    if (!data || typeof data !== "object") throw new StoreError("The run data couldn't be read.", 400);
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new StoreError("The run data couldn't be read.", 400);
 
     const r = await this.row(code);
     if (!r) throw new StoreError("Run not found.", 404);
@@ -438,5 +489,61 @@ export class RunStore {
         this.db.prepare(`UPDATE imported_products SET deleted_at = ?, deleted_by = ? WHERE product_id = ? AND deleted_at IS NULL`).bind(t, user, id),
       ),
     );
+    // A deleted product has no stock left, so the same invoice may add it again.
+    await this.db.batch(productIds.map((id) => this.db.prepare(`UPDATE stock_changes SET undone_at = ?, dedupe_key = NULL WHERE product_id = ? AND undone_at IS NULL`).bind(t, id)));
+  }
+
+  /**
+   * Claim "this invoice adds this stock to this product" before touching Shopify. Returns the keys that were
+   * free; a key already held means the same invoice already added its stock, so that line is skipped.
+   */
+  async claimStock(
+    entries: { key: string; runId: number; importId: string; productId: string; barcode: string | null; qty: number; locationId: string; kind: "created" | "added" }[],
+    user: string,
+  ): Promise<Set<string>> {
+    const free = new Set<string>();
+    if (!entries.length) return free;
+    await this.ready();
+    const t = now();
+    const res = await this.db.batch(
+      entries.map((e) =>
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO stock_changes (dedupe_key, run_id, import_id, product_id, barcode, qty, location_id, kind, created_by, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .bind(e.key, e.runId, e.importId, e.productId, e.barcode, e.qty, e.locationId, e.kind, user, t),
+      ),
+    );
+    entries.forEach((e, i) => {
+      if ((res[i]?.meta.changes ?? 0) > 0) free.add(e.key);
+    });
+    return free;
+  }
+
+  /** Shopify refused: give the claim back so the line can be tried again. */
+  async releaseStock(keys: string[]) {
+    if (!keys.length) return;
+    await this.ready();
+    await this.db.batch(keys.map((k) => this.db.prepare(`DELETE FROM stock_changes WHERE dedupe_key = ?`).bind(k)));
+  }
+
+  /** Stock this import added to products that were already in the store, and that hasn't been taken back out. */
+  async stockAddedByImport(importId: string, productIds: string[]): Promise<{ id: number; productId: string; qty: number; locationId: string }[]> {
+    await this.ready();
+    if (!productIds.length) return [];
+    const marks = productIds.map(() => "?").join(",");
+    const { results } = await this.db
+      .prepare(`SELECT id, product_id, qty, location_id FROM stock_changes WHERE import_id = ? AND kind = 'added' AND undone_at IS NULL AND product_id IN (${marks})`)
+      .bind(importId, ...productIds)
+      .all<{ id: number; product_id: string; qty: number; location_id: string }>();
+    return results.map((r) => ({ id: r.id, productId: r.product_id, qty: r.qty, locationId: r.location_id }));
+  }
+
+  async markStockUndone(ids: number[]) {
+    if (!ids.length) return;
+    await this.ready();
+    const t = now();
+    await this.db.batch(ids.map((id) => this.db.prepare(`UPDATE stock_changes SET undone_at = ?, dedupe_key = NULL WHERE id = ?`).bind(t, id)));
   }
 }

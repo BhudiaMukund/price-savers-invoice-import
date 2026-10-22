@@ -1,6 +1,8 @@
 // Turns a picked file into what the API wants, doing the heavy work in the browser
 // (Excel -> CSV, photos shrunk, base64 encoding) so the server stays inside its free CPU allowance.
 
+import { decodeText, parseDelimited, sheetsFromWorkbook, tidyGrid } from "./sheet-read.js";
+
 const MAX_PDF_BYTES = 7 * 1024 * 1024;
 const PHOTO_LONG_EDGE = 2400;
 
@@ -37,7 +39,8 @@ export function loadSheetJS() {
   return xlsxLoading;
 }
 
-async function spreadsheetToText(file) {
+/** Excel / OpenDocument to sheets of text cells, row and column numbers as in the file (A1 = [0][0]). */
+async function readWorkbook(file) {
   const XLSX = await loadSheetJS();
   let wb;
   try {
@@ -45,14 +48,66 @@ async function spreadsheetToText(file) {
   } catch {
     throw new FileProblem("This spreadsheet couldn't be opened. Save it again from Excel and retry.");
   }
-  const parts = [];
-  for (const name of wb.SheetNames) {
-    // rawNumbers keeps barcodes like 9310720073156 intact instead of 9.31072E+12.
-    const csv = XLSX.utils.sheet_to_csv(wb.Sheets[name], { rawNumbers: true, blankrows: false }).trim();
-    if (csv.replace(/[,\s]/g, "")) parts.push(`## Sheet: ${name}\n${csv}`);
+  const sheets = sheetsFromWorkbook(XLSX, wb);
+  if (!sheets.length) throw new FileProblem("This spreadsheet has no data in it.");
+  return sheets;
+}
+
+/** CSV / TSV / TXT to one sheet, whatever the encoding and separator. */
+async function readDelimited(file) {
+  const text = decodeText(new Uint8Array(await file.arrayBuffer()));
+  const grid = tidyGrid(parseDelimited(text));
+  if (!grid.some((r) => r.length)) throw new FileProblem("This file has no data in it.");
+  return [{ name: file.name.replace(/\.[^.]+$/, ""), grid }];
+}
+
+const latin1 = (bytes) => {
+  let text = "";
+  for (let i = 0; i < bytes.length; i += 65536) text += String.fromCharCode(...bytes.subarray(i, i + 65536));
+  return text;
+};
+
+/** The page count written in a piece of PDF text: the page tree's /Count, or the page objects. */
+function pagesIn(text) {
+  let count = 0;
+  for (const m of text.matchAll(/\/Type\s*\/Pages\b[^]*?\/Count\s+(\d+)/g)) count = Math.max(count, Number(m[1]));
+  for (const m of text.matchAll(/\/Count\s+(\d+)[^]{0,200}?\/Type\s*\/Pages\b/g)) count = Math.max(count, Number(m[1]));
+  const leaves = (text.match(/\/Type\s*\/Page(?![a-zA-Z])/g) ?? []).length;
+  return Math.max(count, leaves);
+}
+
+async function inflate(bytes) {
+  const out = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+  return new Uint8Array(await new Response(out).arrayBuffer());
+}
+
+/**
+ * How many pages a PDF has, read from the file itself (0 when it can't tell). Newer PDFs keep their page
+ * list inside compressed "object streams", so those are unpacked too. Used so a long PDF read a few pages at
+ * a time doesn't depend on the AI's count.
+ */
+export async function pdfPageCount(bytes) {
+  const text = latin1(bytes);
+  const plain = pagesIn(text);
+  if (plain) return plain;
+  let count = 0;
+  let seen = 0;
+  for (const m of text.matchAll(/stream\r?\n/g)) {
+    if (seen++ > 400) break;
+    const dictStart = text.lastIndexOf("<<", m.index);
+    const dict = text.slice(dictStart, m.index);
+    if (dictStart < 0 || m.index - dictStart > 600 || !/\/ObjStm\b/.test(dict) || !/\/FlateDecode\b/.test(dict) || /\/DecodeParms/.test(dict)) continue;
+    const start = m.index + m[0].length;
+    const len = /\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dict);
+    const end = len ? start + Number(len[1]) : text.indexOf("endstream", start);
+    if (end <= start) continue;
+    try {
+      count = Math.max(count, pagesIn(latin1(await inflate(bytes.subarray(start, end)))));
+    } catch {
+      /* a stream that won't unpack: skip it */
+    }
   }
-  if (!parts.length) throw new FileProblem("This spreadsheet has no data in it.");
-  return parts.join("\n\n");
+  return count;
 }
 
 function toBase64(blob) {
@@ -88,17 +143,17 @@ async function preparePhoto(file) {
   return { blob, type: "image/jpeg" };
 }
 
-/** Returns { kind: "text", text } or { kind: "base64", mimeType, base64 }. */
+/** Returns { kind: "sheets", sheets: [{ name, grid }] } or { kind: "base64", mimeType, base64 }. */
 export async function prepare(file) {
   if (file.size === 0) throw new FileProblem("This file is empty.");
   switch (typeOf(file)) {
     case "spreadsheet":
-      return { kind: "text", text: await spreadsheetToText(file) };
+      return { kind: "sheets", sheets: await readWorkbook(file) };
     case "text":
-      return { kind: "text", text: await file.text() };
+      return { kind: "sheets", sheets: await readDelimited(file) };
     case "pdf":
       if (file.size > MAX_PDF_BYTES) throw new FileProblem("This PDF is over 7 MB. Split it into smaller files.");
-      return { kind: "base64", mimeType: "application/pdf", base64: await toBase64(file) };
+      return { kind: "base64", mimeType: "application/pdf", base64: await toBase64(file), pages: await pdfPageCount(new Uint8Array(await file.arrayBuffer())).catch(() => 0) };
     case "photo": {
       const { blob, type } = await preparePhoto(file);
       return { kind: "base64", mimeType: type, base64: await toBase64(blob) };

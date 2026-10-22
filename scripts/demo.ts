@@ -8,12 +8,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import app from "../src/index";
 import { sqliteDb } from "../test/sqlite-db";
+// @ts-ignore -- plain browser module
+import { basicTitle } from "../public/js/titles.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PUBLIC = path.join(ROOT, "public");
 const realFetch = globalThis.fetch;
 
-type V = { barcode: string; sku: string; product: { id: string; title: string; handle: string }; vendor?: string; photos?: number };
+type V = { barcode: string; sku: string; product: { id: string; title: string; handle: string; status?: string }; vendor?: string; photos?: number };
 let n = 100;
 const store: V[] = [
   ["9310720073156", "Balloons Latex 30cm Assorted 25pk"],
@@ -24,6 +26,8 @@ const store: V[] = [
 for (const [b, t, sku] of [["9399111770133", "Black Skull Candle Holder 12cm", "HN-7701"], ["", "LED Finger Lights (Pack of 4)", "HN-8010"]]) {
   store.push({ barcode: b, sku, product: { id: `gid://shopify/Product/${n++}`, title: t, handle: t.toLowerCase().replace(/\W+/g, "-") }, vendor: "Harbour Novelty Imports" } as V);
 }
+// A product that was left as a draft: an invoice line for it makes it active.
+store.push({ barcode: "9300000000019", sku: "", product: { id: `gid://shopify/Product/${n++}`, title: "Cake Candles Gold Numerals", handle: "cake-candles-gold-numerals", status: "DRAFT" } });
 // pad store to look realistic
 for (let i = 0; i < 1955; i++) store.push({ barcode: "", sku: "", product: { id: `gid://shopify/Product/${n++}`, title: `Filler ${i}`, handle: `f${i}` } });
 
@@ -52,10 +56,24 @@ const SUPPLIER_ITEMS = [
   { invoiceTitle: "PLT PPR 23CM PSTL PNK 10PK", title: "Pastel Pink Paper Plates 23cm (Pack of 10)", supplierCode: "PP23-PK", barcode: "9311192703312" },
 ];
 
+// A PDF with "long" in its name: 8 pages, 3 products a page, too long to read in one go.
+const LONG_PDF = { active: false };
+const LONG_PDF_ITEMS = Array.from({ length: 24 }, (_, i) => {
+  const n = i + 1;
+  const body = `93990017${String(1000 + n).padStart(4, "0")}`;
+  let sum = 0;
+  for (let k = body.length - 1, w = 3; k >= 0; k--, w = w === 3 ? 1 : 3) sum += Number(body[k]) * w;
+  const barcode = body + ((10 - (sum % 10)) % 10);
+  return { invoiceTitle: `CNDL NUMERAL ${n} GLTR GLD`, title: `Gold Glitter Number ${n} Candle`, supplierCode: `SB-C${n}`, barcode };
+});
+
 // Products "created" in this demo session, and suppliers saved through the page.
+/** Stock per product, so the demo can show tracking being turned on and quantities added. */
+const inv = new Map<string, { tracked: boolean; level: boolean; onHand: number }>();
 const created: Record<string, { vendor?: string; importId: string | null; price: string; tags?: string[] }> = {};
 let savedSuppliers: string | null = null;
 
+let aiDownCount = 0;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 globalThis.fetch = (async (input: any, init: any = {}) => {
@@ -63,12 +81,36 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
   if (url.includes("generativelanguage.googleapis.com")) {
     // DEMO_AI_BUSY=1 npm run demo: the main model answers "overloaded", to try the automatic retry.
     if (process.env.DEMO_AI_BUSY && url.includes(env.AI_MODEL)) return new Response("overloaded", { status: 503 });
+    // DEMO_AI_DOWN=N: the first N AI requests (both models) answer "overloaded", like a busy spell on Google's side.
+    if (Number(process.env.DEMO_AI_DOWN) > aiDownCount) {
+      aiDownCount++;
+      return new Response("overloaded", { status: 503 });
+    }
     const body = typeof init.body === "string" ? init.body : await new Response(init.body).text();
     const json = JSON.parse(body); // proves the streamed body is valid JSON
     await sleep(900);
     const part = json.contents[0].parts[1];
-    if (String(json.contents[0].parts[0].text).includes("product catalogue")) {
-      return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(demoMap(part.text)) }] } }] });
+    const prompt = String(json.contents[0].parts[0].text);
+    const reply = (obj: unknown, finishReason = "STOP") => Response.json({ candidates: [{ finishReason, content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+    if (prompt.includes("product catalogue")) return reply(demoMap(part.text));
+    if (prompt.includes("first rows of a supplier invoice")) return reply(demoInvoiceMap(part.text));
+    if (prompt.includes("You rewrite supplier product descriptions")) {
+      // DEMO_TITLES_DOWN=1: the AI refuses title requests, to see titles fall back to the simple tidy.
+      if (process.env.DEMO_TITLES_DOWN) return new Response("forbidden", { status: 403 });
+      if (process.env.DEMO_SLOW_TITLES) await sleep(Number(process.env.DEMO_SLOW_TITLES));
+      return reply(demoTitles(part.text));
+    }
+    // A PDF named "...long..." is too long for one reply: it has to be read a few pages at a time.
+    const pages = /Only return product lines printed on (?:page (\d+)|pages (\d+) to (\d+))/.exec(prompt);
+    if (LONG_PDF.active) {
+      LONG_PDF.active = false;
+      if (!pages) return reply({}, "MAX_TOKENS");
+      const from = Number(pages[1] ?? pages[2]);
+      const to = Number(pages[1] ?? pages[3]);
+      if (to - from >= 3) return reply({}, "MAX_TOKENS");
+      const items = [];
+      for (let p = from; p <= Math.min(to, 8); p++) items.push(...LONG_PDF_ITEMS.slice((p - 1) * 3, p * 3));
+      return reply({ supplierName: "Sunburst Party Supplies", invoiceNumber: "INV-50112", pageCount: 8, items });
     }
     let items = SUPPLIER_ITEMS;
     if (part.text && part.text.includes("HARBOUR NOVELTY")) {
@@ -98,8 +140,55 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
     await sleep(120);
     const filesReply = filesApi(query, variables);
     if (filesReply) return filesReply;
+    if (query.includes("Stock($ids")) {
+      return Response.json({
+        data: {
+          nodes: variables.ids.map((id: string) => {
+            const v = store.find((x) => x.product.id === id);
+            if (!v) return null;
+            const s = inv.get(id) ?? { tracked: false, level: false, onHand: 0 };
+            return { id, variants: { nodes: [{ id: `${id}/v`, barcode: v.barcode, inventoryItem: { id: `${id}/i`, tracked: s.tracked, inventoryLevel: s.level ? { id: `${id}/l` } : null } }] } };
+          }),
+        },
+      });
+    }
+    if (query.includes("Status($ids")) {
+      return Response.json({ data: { nodes: variables.ids.map((id: string) => { const v = store.find((x) => x.product.id === id); return v ? { id, status: v.product.status ?? "ACTIVE" } : null; }) } });
+    }
+    if (query.startsWith("mutation { m0")) {
+      const data: Record<string, unknown> = {};
+      for (const m of query.matchAll(/m(\d+): productUpdate\(product: \{id: "([^"]+)", status: ACTIVE\}/g)) {
+        const v = store.find((x) => x.product.id === m[2]);
+        if (v) v.product.status = "ACTIVE";
+        console.log(`[demo] made active: ${v?.product.title}`);
+        data[`m${m[1]}`] = { userErrors: [] };
+      }
+      for (const m of query.matchAll(/m(\d+): publishablePublish\(id: "([^"]+)"/g)) {
+        console.log(`[demo] put on Point of Sale: ${m[2]}`);
+        data[`m${m[1]}`] = { userErrors: [] };
+      }
+      for (const m of query.matchAll(/m(\d+): (inventoryItemUpdate|inventoryActivate)\((?:id|inventoryItemId): "([^"]+)\/i"/g)) {
+        const s = inv.get(m[3]!) ?? { tracked: false, level: false, onHand: 0 };
+        if (m[2] === "inventoryItemUpdate") s.tracked = true;
+        else s.level = true;
+        inv.set(m[3]!, s);
+        console.log(`[demo] ${m[2] === "inventoryItemUpdate" ? "stock tracking turned on" : "stocked at the location"} for ${m[3]}`);
+        data[`m${m[1]}`] = { userErrors: [] };
+      }
+      return Response.json({ data });
+    }
+    if (query.includes("inventoryAdjustQuantities")) {
+      for (const ch of variables.input.changes) {
+        const id = String(ch.inventoryItemId).replace(/\/i$/, "");
+        const s = inv.get(id) ?? { tracked: false, level: false, onHand: 0 };
+        s.onHand += ch.delta;
+        inv.set(id, s);
+        console.log(`[demo] stock ${ch.delta >= 0 ? "+" : ""}${ch.delta} (${variables.input.reason}) on ${id} -> ${s.onHand}`);
+      }
+      return Response.json({ data: { inventoryAdjustQuantities: { userErrors: [] } } });
+    }
     if (query.includes("locations(")) {
-      return Response.json({ data: { locations: { nodes: [{ id: "gid://shopify/Location/1", name: "West Lakes" }] }, publications: { nodes: [{ id: "gid://shopify/Publication/1", name: "Online Store" }, { id: "gid://shopify/Publication/2", name: "Point of Sale" }] } } });
+      return Response.json({ data: { locations: { nodes: [{ id: "gid://shopify/Location/1", name: "West Lakes" }, { id: "gid://shopify/Location/2", name: "Warehouse" }] }, publications: { nodes: [{ id: "gid://shopify/Publication/1", name: "Online Store" }, { id: "gid://shopify/Publication/2", name: "Point of Sale" }] } } });
     }
     if (query.includes("products(first")) {
       const seen = new Set<string>();
@@ -111,8 +200,20 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
     if (query.includes("productUpdate")) {
       const v = store.find((x) => x.product.id === variables.product.id);
       if (v) v.photos = (v.photos ?? 0) + variables.media.length;
+      const media = variables.media.map(() => ({ id: `gid://shopify/MediaImage/${++fileSeq}` }));
+      for (const m of media) demoFiles.set(m.id, { bytes: null, type: "image/svg+xml", label: "copy", created: 0, fails: false, productId: variables.product.id } as DemoFile);
       console.log(`[demo] added ${variables.media.length} photo copies to ${v?.product.title}`);
-      return Response.json({ data: { productUpdate: { product: { id: variables.product.id }, userErrors: [] } } });
+      return Response.json({ data: { productUpdate: { product: { id: variables.product.id, media: { nodes: media } }, userErrors: [] } } });
+    }
+    if (query.includes("nodes(ids") && query.includes("featuredMedia")) {
+      return Response.json({
+        data: {
+          nodes: variables.ids.map((id: string) => {
+            const v = store.find((x) => x.product.id === id);
+            return v ? { ...v.product, vendor: v.vendor ?? created[id]?.vendor ?? "", featuredMedia: v.photos ? { id: "x" } : null, variants: { nodes: [{ barcode: v.barcode, sku: v.sku }] } } : null;
+          }),
+        },
+      });
     }
     if (query.includes("productVariants") && variables?.q) {
       const terms = String(variables.q).split(" OR ").map((t: string) => t.replace("barcode:", ""));
@@ -164,10 +265,18 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
       if (/fail/i.test(input.title)) return Response.json({ data: { productSet: { product: null, userErrors: [{ field: ["title"], message: "Title is not allowed (test)" }] } } });
       const id = `gid://shopify/Product/${n++}`;
       store.push({ barcode: input.variants[0].barcode ?? "", sku: input.variants[0].sku ?? "", product: { id, title: input.title, handle: "x" } });
+      const q0 = input.variants[0].inventoryQuantities?.[0];
+      if (q0) {
+        inv.set(id, { tracked: true, level: true, onHand: q0.quantity });
+        console.log(`[demo] stock ${q0.quantity} (tracked) at ${q0.locationId} for ${input.title}`);
+      }
       created[id] = { vendor: input.vendor, importId: input.metafields?.[0]?.value ?? null, price: input.variants[0].price, tags: input.tags };
       store[store.length - 1]!.photos = input.files?.length ?? 0;
+      store[store.length - 1]!.vendor = input.vendor;
+      const media = (input.files ?? []).map(() => ({ id: `gid://shopify/MediaImage/${++fileSeq}` }));
+      for (const m of media) demoFiles.set(m.id, { bytes: null, type: "image/svg+xml", label: "copy", created: 0, fails: false, productId: id } as DemoFile);
       console.log(`[demo] created ${input.title} | vendor=${input.vendor} | import_source=${input.metafields?.[0]?.value} | tags=${input.tags} | photos=${input.files?.length ?? 0} | description=${input.descriptionHtml ? "yes" : "no"}`);
-      return Response.json({ data: { productSet: { product: { id }, userErrors: [] } } });
+      return Response.json({ data: { productSet: { product: { id, media: { nodes: media } }, userErrors: [] } } });
     }
     if (query.includes("publishablePublish")) return Response.json({ data: { publishablePublish: { userErrors: [] } } });
   }
@@ -178,7 +287,7 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
 /* ---------------------------------------------------------------- fake Shopify Files */
 
 const staged = new Map<string, { bytes: Buffer; type: string }>();
-type DemoFile = { bytes: Buffer | null; type: string; label: string; created: number; fails: boolean };
+type DemoFile = { bytes: Buffer | null; type: string; label: string; created: number; fails: boolean; productId?: string };
 const demoFiles = new Map<string, DemoFile>();
 let fileSeq = 0;
 
@@ -223,7 +332,13 @@ function filesApi(query: string, variables: any): Response | null {
     });
   }
   if (query.includes("fileDelete")) {
-    for (const id of variables.ids) demoFiles.delete(id);
+    for (const id of variables.ids) {
+      // Deleting a product's photo copy takes it off the product.
+      const pid = demoFiles.get(id)?.productId;
+      const v = pid ? store.find((x) => x.product.id === pid) : undefined;
+      if (v && v.photos) v.photos--;
+      demoFiles.delete(id);
+    }
     console.log(`[demo] deleted ${variables.ids.length} files`);
     return Response.json({ data: { fileDelete: { deletedFileIds: variables.ids, userErrors: [] } } });
   }
@@ -255,6 +370,49 @@ function demoMap(sample: string) {
     }
   }
   return { sheet: null, headerRow: null, columns: { barcode: null, supplierCode: null, title: null, description: null, photoLinks: [] } };
+}
+
+/** The fake AI for spreadsheet invoices: the headings row, and the usual columns by their names. */
+function demoInvoiceMap(sample: string) {
+  for (const block of sample.split("## Sheet: ").slice(1)) {
+    const sheet = block.split("\n")[0]!.replace(/ \(\d+ rows\)$/, "").trim();
+    const top = block.split("\n").slice(1, 4).join(" ");
+    for (const line of block.split("\n").slice(1)) {
+      const m = /^Row (\d+): (.*)$/.exec(line);
+      if (!m) continue;
+      const cells = m[2]!.split(" | ").map((c) => [c.slice(0, c.indexOf("=")), c.slice(c.indexOf("=") + 1)]) as [string, string][];
+      const find = (re: RegExp) => cells.find(([, v]) => re.test(v))?.[0] ?? null;
+      const title = find(/^(description|desc|product( name)?|item description|name)$/i);
+      if (!title) continue;
+      const supplier = /harbour/i.test(top) ? "Harbour Novelty Imports" : /sunburst/i.test(top) ? "Sunburst Party Supplies" : /portacraft/i.test(top) ? "Portacraft" : null;
+      const number = /(?:order no|invoice no)[^|]*\| [A-Z]=([A-Z0-9-]+)/i.exec(top)?.[1] ?? null;
+      return {
+        supplierName: supplier,
+        invoiceNumber: number,
+        layout: "table",
+        sheet,
+        headerRow: Number(m[1]),
+        columns: { title, barcode: find(/^(barcode|ean|apn|upc)/i), supplierCode: find(/^(item no|stock code|code|sku|product code)$/i), titleExtras: cells.filter(([, v]) => /^(colour|color|size)$/i.test(v)).map(([c]) => c) },
+      };
+    }
+  }
+  return { supplierName: null, invoiceNumber: null, layout: "other", sheet: null, headerRow: null, columns: { title: null, barcode: null, supplierCode: null, titleExtras: [] } };
+}
+
+/** The fake AI for titles: the sample invoices' tidy titles, otherwise the simple rules. */
+const KNOWN_TITLES = new Map([...HARBOUR_ITEMS, ...SUPPLIER_ITEMS].map((i) => [i.invoiceTitle.toUpperCase(), i.title]));
+function demoTitles(text: string) {
+  const items = [];
+  for (const line of text.split("\n")) {
+    const m = /^(t\d+): (.*)$/.exec(line);
+    if (!m) continue;
+    const original = m[2]!;
+    // DEMO_TITLE_SWAP=1: answer every 7th line with its neighbour's title, to see the checks catch it.
+    const known = KNOWN_TITLES.get(original.toUpperCase()) ?? basicTitle(original);
+    items.push({ id: m[1], original, title: known });
+  }
+  if (process.env.DEMO_TITLE_SWAP) for (let i = 6; i < items.length; i += 7) [items[i]!.title, items[i - 1]!.title] = [items[i - 1]!.title, items[i]!.title];
+  return { items };
 }
 
 // Runs are kept in an in-memory SQLite database (needs Node 22.13 or newer); they vanish when the demo stops.
@@ -289,6 +447,7 @@ http
       return res.end(f.bytes ?? standIn(f.label));
     }
     if (url.pathname.startsWith("/api/")) {
+      if (url.pathname === "/api/extract-file" && /long/i.test(decodeURIComponent(String(req.headers["x-file-name"] ?? "")))) LONG_PDF.active = true;
       const hasBody = req.method !== "GET" && req.method !== "HEAD";
       const request = new Request(url, {
         method: req.method,

@@ -22,11 +22,39 @@ const TOGGLES = [
 export function createSettings(ctx) {
   const { api, h, $, icon, toast, confirmDialog, fact, errorText, plural, state, SessionExpired } = ctx;
   let suppliers = null; // [{ name, saved, products, catalogues }]
+  let locations = null; // [{ id, name }] once loaded, or { error }
   let onlyUnused = false;
 
   async function show() {
     renderToggles();
     loadSuppliers();
+    loadLocations();
+  }
+
+  async function loadLocations() {
+    if (!state.health?.shopify) return;
+    try {
+      locations = (await api.locations()).locations;
+    } catch (err) {
+      locations = { error: errorText(err) };
+    }
+    renderToggles();
+  }
+
+  /** Where the stock goes: a choice of the store's locations. Whether a run updates stock is set on the import screen. */
+  function locationRow(s) {
+    const select = h("select", { class: "set-select", id: "set-stockLocationId", disabled: locked() || !s || !Array.isArray(locations) });
+    const list = Array.isArray(locations) ? locations : [];
+    select.append(h("option", { value: "" }, list.length ? `${list[0].name} (the first location)` : "The store's first location"));
+    for (const l of list) select.append(h("option", { value: l.id }, l.name));
+    select.value = s?.stockLocationId ?? "";
+    select.addEventListener("change", () => save("stockLocationId", select.value, select));
+    return h(
+      "li",
+      { class: "set-row" },
+      h("div", { class: "set-text" }, h("label", { for: "set-stockLocationId", class: "set-title" }, "Stock goes to"), h("p", {}, locations?.error ? `Couldn't load locations. ${locations.error}` : "The Shopify location that receives invoice quantities, for runs that update stock.")),
+      select,
+    );
   }
 
   function locked() {
@@ -43,24 +71,28 @@ export function createSettings(ctx) {
         const input = h("input", { type: "checkbox", class: "switch-input", id: `set-${t.key}`, role: "switch", disabled: locked() || !s });
         input.checked = Boolean(s?.[t.key]);
         input.addEventListener("change", () => save(t.key, input.checked, input));
-        return h(
+        const row = h(
           "li",
           { class: "set-row" },
           h("div", { class: "set-text" }, h("label", { for: `set-${t.key}`, class: "set-title" }, t.title), h("p", {}, t.text)),
           h("span", { class: "switch" }, input, h("span", { class: "switch-track", "aria-hidden": "true" }, h("span", { class: "switch-thumb" }))),
         );
+        return row;
       }),
+      locationRow(s),
     );
   }
 
   async function save(key, value, input) {
     input.disabled = true;
+    const before = state.health?.settings?.[key];
     try {
       const res = await api.saveSettings({ [key]: value });
       state.health.settings = res.settings;
       toast("ok", "Saved.");
     } catch (err) {
-      input.checked = !value;
+      if (typeof value === "boolean") input.checked = !value;
+      else input.value = before ?? "";
       toast("bad", `Couldn't save. ${errorText(err)}`);
     } finally {
       input.disabled = locked();
@@ -158,5 +190,11 @@ export function createSettings(ctx) {
     $("#set-sup-refresh").addEventListener("click", loadSuppliers);
   }
 
-  return { show, wire, renderToggles };
+  /** Called once the shop details arrive, if this page was opened first: the locations can load now. */
+  function refresh() {
+    renderToggles();
+    if (!locations) loadLocations();
+  }
+
+  return { show, wire, renderToggles, refresh };
 }
