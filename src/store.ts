@@ -37,6 +37,20 @@ const SCHEMA = [
      invoice_names TEXT NOT NULL DEFAULT '',
      suppliers TEXT NOT NULL DEFAULT ''
    )`,
+  // Foil balloons this tool added: they go to every sales channel once priced, and most have a helium bundle
+  // ("Helium INFLATED ... Foil Balloon") whose price is kept at balloon + inflation.
+  `CREATE TABLE IF NOT EXISTS balloon_products (
+     product_id TEXT PRIMARY KEY,
+     import_id TEXT NOT NULL,
+     run_id INTEGER NOT NULL,
+     bundle_id TEXT,
+     bundle_variant_id TEXT,
+     tier_variant_id TEXT,
+     online INTEGER NOT NULL DEFAULT 0,
+     created_at TEXT NOT NULL,
+     deleted_at TEXT
+   )`,
+  `CREATE INDEX IF NOT EXISTS balloon_bundle ON balloon_products(bundle_id)`,
   `CREATE TABLE IF NOT EXISTS imported_products (
      product_id TEXT PRIMARY KEY,
      run_id INTEGER NOT NULL,
@@ -134,6 +148,30 @@ const SCHEMA = [
      removed_catalogue TEXT
    )`,
   `CREATE INDEX IF NOT EXISTS product_photos_file ON product_photos(file_id)`,
+  // Store photos swapped for a newer or sharper catalogue photo. Every product + catalogue photo pair is looked at
+  // once: "none" means it was checked and nothing changed, so it isn't checked again.
+  `CREATE TABLE IF NOT EXISTS photo_updates (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     product_id TEXT NOT NULL,
+     product_title TEXT,
+     file_id TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     status TEXT NOT NULL,
+     old_media_id TEXT,
+     old_url TEXT,
+     old_size TEXT,
+     new_media_id TEXT,
+     new_url TEXT,
+     new_size TEXT,
+     catalogue TEXT,
+     error TEXT,
+     created_at TEXT NOT NULL,
+     created_by TEXT,
+     decided_at TEXT,
+     decided_by TEXT,
+     UNIQUE (product_id, file_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS photo_updates_status ON photo_updates(status, kind)`,
   `CREATE INDEX IF NOT EXISTS product_photos_product ON product_photos(product_id)`,
   // Shared settings (the Settings page), one row per setting.
   `CREATE TABLE IF NOT EXISTS settings (
@@ -155,12 +193,27 @@ const ADDED_COLUMNS = [
   `ALTER TABLE catalogue_files ADD COLUMN merged_into TEXT`,
 ];
 
+/** Indexes on those added columns (they can only be made once the column exists). Without them each merge
+ *  or progress check reads every photo row, which adds up to millions of reads on a big catalogue. */
+const ADDED_INDEXES = [
+  `CREATE INDEX IF NOT EXISTS cat_files_merged ON catalogue_files(merged_into) WHERE merged_into IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS cat_files_processing ON catalogue_files(created_at) WHERE status = 'processing'`,
+  `CREATE INDEX IF NOT EXISTS cat_files_nosig ON catalogue_files(created_at) WHERE status = 'ready' AND sig IS NULL AND url IS NOT NULL`,
+];
+
 async function addColumns(db: Db) {
   for (const sql of ADDED_COLUMNS) {
     try {
       await db.prepare(sql).run();
     } catch {
       /* already there */
+    }
+  }
+  for (const sql of ADDED_INDEXES) {
+    try {
+      await db.prepare(sql).run();
+    } catch {
+      /* best effort */
     }
   }
 }
@@ -282,6 +335,37 @@ export function summarise(data: RunData, code: string, user: string) {
     search: bits.join(" \n ").toLowerCase().slice(0, 60_000),
   };
 }
+
+export interface BalloonRow {
+  rid?: number;
+  productId: string;
+  importId: string;
+  runId: number;
+  bundleId: string | null;
+  bundleVariantId: string | null;
+  tierVariantId: string | null;
+  online: boolean;
+}
+type BalloonDbRow = {
+  rid: number;
+  product_id: string;
+  import_id: string;
+  run_id: number;
+  bundle_id: string | null;
+  bundle_variant_id: string | null;
+  tier_variant_id: string | null;
+  online: number;
+};
+const balloonRow = (r: BalloonDbRow): BalloonRow => ({
+  rid: Number(r.rid),
+  productId: r.product_id,
+  importId: r.import_id,
+  runId: Number(r.run_id),
+  bundleId: r.bundle_id,
+  bundleVariantId: r.bundle_variant_id,
+  tierVariantId: r.tier_variant_id,
+  online: !!r.online,
+});
 
 export class RunStore {
   constructor(private db: Db) {}
@@ -468,6 +552,58 @@ export class RunStore {
     );
   }
 
+  /**
+   * Live products this tool added, oldest first, a page at a time: for one run, or (runCode empty) every run.
+   * `after` is the last row number of the previous page.
+   */
+  async liveProducts(runCode: string, after: number, limit: number): Promise<{ rows: { rid: number; productId: string; title: string; barcode: string | null; vendor: string | null; run: string }[]; next: number | null }> {
+    await this.ready();
+    const { results } = await this.db
+      .prepare(
+        `SELECT p.rowid AS rid, p.product_id AS productId, p.title, p.barcode, p.vendor, r.code AS run
+           FROM imported_products p JOIN runs r ON r.id = p.run_id
+          WHERE p.deleted_at IS NULL AND (? = '' OR r.code = ?) AND p.rowid > ?
+          ORDER BY p.rowid LIMIT ?`,
+      )
+      .bind(runCode, runCode, after, limit + 1)
+      .all<{ rid: number; productId: string; title: string; barcode: string | null; vendor: string | null; run: string }>();
+    const more = results.length > limit;
+    const rows = results.slice(0, limit);
+    return { rows, next: more ? rows[rows.length - 1]!.rid : null };
+  }
+
+  /** Every live product this run added, for checking against what is really in Shopify. */
+  async liveForRun(runId: number): Promise<{ productId: string; invoiceId: string; title: string }[]> {
+    await this.ready();
+    const { results } = await this.db
+      .prepare(`SELECT product_id AS productId, invoice_id AS invoiceId, title FROM imported_products WHERE run_id = ? AND deleted_at IS NULL ORDER BY rowid LIMIT 1000`)
+      .bind(runId)
+      .all<{ productId: string; invoiceId: string; title: string }>();
+    return results;
+  }
+
+  /**
+   * Stop tracking an invoice's products that are still in Shopify, so the invoice can leave the run. Nothing in
+   * Shopify changes, and the stock ledger is left alone (the same invoice still can't add its stock twice).
+   */
+  async releaseInvoice(runId: number, invoiceId: string, user: string): Promise<number> {
+    await this.ready();
+    const res = await this.db
+      .prepare(`UPDATE imported_products SET deleted_at = ?, deleted_by = ? WHERE run_id = ? AND invoice_id = ? AND deleted_at IS NULL`)
+      .bind(now(), `released by ${user}`, runId, invoiceId)
+      .run();
+    return Number(res.meta.changes ?? 0);
+  }
+
+  /** Which of these products this tool added and are still live (so only they can be priced here). */
+  async liveOwn(productIds: string[]): Promise<Set<string>> {
+    await this.ready();
+    if (!productIds.length) return new Set();
+    const marks = productIds.map(() => "?").join(",");
+    const { results } = await this.db.prepare(`SELECT product_id FROM imported_products WHERE deleted_at IS NULL AND product_id IN (${marks})`).bind(...productIds).all<{ product_id: string }>();
+    return new Set(results.map((r) => r.product_id));
+  }
+
   /** Which of these products the ledger says belong to this import and are still live. */
   async liveInImport(importId: string, productIds: string[]): Promise<Set<string>> {
     await this.ready();
@@ -478,6 +614,67 @@ export class RunStore {
       .bind(importId, ...productIds)
       .all<{ product_id: string }>();
     return new Set(results.map((r) => r.product_id));
+  }
+
+  /** Record foil balloons this tool added, with their helium bundles. */
+  async recordBalloons(entries: BalloonRow[]) {
+    if (!entries.length) return;
+    await this.ready();
+    const t = now();
+    await this.db.batch(
+      entries.map((e) =>
+        this.db
+          .prepare(
+            `INSERT OR REPLACE INTO balloon_products (product_id, import_id, run_id, bundle_id, bundle_variant_id, tier_variant_id, online, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .bind(e.productId, e.importId, e.runId, e.bundleId, e.bundleVariantId, e.tierVariantId, e.online ? 1 : 0, t),
+      ),
+    );
+  }
+
+  /** Live balloon records for these balloon products. */
+  async balloonsFor(productIds: string[]): Promise<BalloonRow[]> {
+    await this.ready();
+    if (!productIds.length) return [];
+    const marks = productIds.map(() => "?").join(",");
+    const { results } = await this.db
+      .prepare(`SELECT rowid AS rid, * FROM balloon_products WHERE deleted_at IS NULL AND product_id IN (${marks})`)
+      .bind(...productIds)
+      .all<BalloonDbRow>();
+    return results.map(balloonRow);
+  }
+
+  /** Every live balloon record, a page at a time (`after` is the last row number of the previous page). */
+  async balloonsPage(after: number, limit: number): Promise<{ rows: BalloonRow[]; next: number | null }> {
+    await this.ready();
+    const { results } = await this.db
+      .prepare(`SELECT rowid AS rid, * FROM balloon_products WHERE deleted_at IS NULL AND rowid > ? ORDER BY rowid LIMIT ?`)
+      .bind(after, limit + 1)
+      .all<BalloonDbRow>();
+    const rows = results.slice(0, limit).map(balloonRow);
+    return { rows, next: results.length > limit ? (rows[rows.length - 1]!.rid ?? null) : null };
+  }
+
+  async markBalloonsOnline(productIds: string[]) {
+    if (!productIds.length) return;
+    await this.ready();
+    await this.db.batch(productIds.map((id) => this.db.prepare(`UPDATE balloon_products SET online = 1 WHERE product_id = ?`).bind(id)));
+  }
+
+  /** The balloon (and its bundle) is gone. */
+  async markBalloonsDeleted(productIds: string[]) {
+    if (!productIds.length) return;
+    await this.ready();
+    const t = now();
+    await this.db.batch(productIds.map((id) => this.db.prepare(`UPDATE balloon_products SET deleted_at = ? WHERE product_id = ? AND deleted_at IS NULL`).bind(t, id)));
+  }
+
+  /** The bundle alone is gone (deleted by hand): the balloon stays, with no bundle. */
+  async clearBundles(bundleIds: string[]) {
+    if (!bundleIds.length) return;
+    await this.ready();
+    await this.db.batch(bundleIds.map((id) => this.db.prepare(`UPDATE balloon_products SET bundle_id = NULL, bundle_variant_id = NULL WHERE bundle_id = ?`).bind(id)));
   }
 
   async markDeleted(productIds: string[], user: string) {

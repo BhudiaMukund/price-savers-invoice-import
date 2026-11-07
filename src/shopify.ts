@@ -133,6 +133,16 @@ export async function fetchStoreProducts(env: Env): Promise<StoreProduct[]> {
   return out;
 }
 
+/** How many variants the store has (one request). */
+export async function countVariants(env: Env): Promise<number> {
+  try {
+    const data = await gql<{ productVariantsCount: { count: number } }>(env, `query { productVariantsCount { count } }`);
+    return Number(data.productVariantsCount?.count ?? 0);
+  } catch {
+    return 0; // only shown as "store checked"; never worth failing a read for
+  }
+}
+
 /**
  * Look up only the variants whose barcode matches one of these codes (in any GTIN spelling).
  * Much cheaper than fetching the whole catalogue; used as the last check right before creating.
@@ -151,13 +161,13 @@ export async function findVariantsByBarcodes(env: Env, barcodes: (string | null 
     };
   };
   // Keep each search query short.
-  for (let i = 0; i < terms.length; i += 40) {
+  for (let i = 0; i < terms.length; i += 50) {
     const data = await gql<R>(
       env,
       `query Find($q: String!) {
          productVariants(first: 250, query: $q) { nodes { barcode sku product { id title handle status } } }
        }`,
-      { q: terms.slice(i, i + 40).join(" OR ") },
+      { q: terms.slice(i, i + 50).join(" OR ") },
     );
     for (const v of data.productVariants.nodes) {
       out.push({ productId: v.product.id, title: v.product.title, handle: v.product.handle, barcode: v.barcode ?? "", sku: v.sku ?? "", status: v.product.status });
@@ -169,6 +179,8 @@ export async function findVariantsByBarcodes(env: Env, barcodes: (string | null 
 export interface ShopContext {
   locationId: string;
   posPublicationId: string | null;
+  /** Every sales channel (Online Store, Point of Sale, Shop, ...), for products that go everywhere. */
+  publicationIds: string[];
   /** Where the import ID is saved on each product, with the type of the store's existing definition. */
   importSource: { namespace: string; key: string; type: string };
 }
@@ -206,6 +218,7 @@ export async function getShopContext(env: Env): Promise<ShopContext> {
   return {
     locationId: location.id,
     posPublicationId: pos?.id ?? null,
+    publicationIds: data.publications.nodes.map((p) => p.id),
     importSource: { ...field, type: defType && IMPORT_SOURCE_TYPES.has(defType) ? defType : "single_line_text_field" },
   };
 }
@@ -236,12 +249,24 @@ export interface NewProduct {
   description?: string | null;
   /** Add the import-<ID> and run-<code> tags (the "Tag new products" setting). Default on. */
   tags?: boolean;
+  /** Price including GST, "4.95". Without it the product starts at $0.00 and is priced later. */
+  price?: string;
   /** Start with this much stock at this location, with stock tracking turned on. */
   stock?: { quantity: number; locationId: string };
+  /** Shopify's product type, e.g. "Foil Balloons". */
+  productType?: string;
+  /** A physical item that can be posted (foil balloons sold online). Default: in-store only. */
+  requiresShipping?: boolean;
+  /** Publish to every sales channel instead of Point of Sale only. Only for products that have a price. */
+  online?: boolean;
+  /** Default ACTIVE. A helium bundle waits as DRAFT until its balloon has a price. */
+  status?: "ACTIVE" | "DRAFT";
+  /** A bundle parent: its variant can only be sold with its components (added after it's made). */
+  bundle?: boolean;
 }
 
 export type CreateResult =
-  | { ok: true; productId: string; published: boolean; photos: number; photoError?: string; mediaIds: string[] }
+  | { ok: true; productId: string; variantId: string | null; published: boolean; photos: number; photoError?: string; mediaIds: string[] }
   | { ok: false; error: string };
 
 /** Plain text to safe HTML paragraphs. */
@@ -256,7 +281,7 @@ export function textToHtml(text: string): string {
 }
 
 /**
- * Create one ACTIVE product: price 0.00, inventory NOT tracked and NOT a physical/shippable item,
+ * Create one ACTIVE product: price 0.00 (or the price given), inventory NOT tracked and NOT a physical/shippable item,
  * then publish it to Point of Sale ONLY (never the Online Store), so a $0 item can't be bought online
  * or leak into the Google Shopping feed.
  */
@@ -264,33 +289,35 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
   const mutation = `
     mutation Create($input: ProductSetInput!) {
       productSet(synchronous: true, input: $input) {
-        product { id media(first: 20) { nodes { id } } }
+        product { id media(first: 20) { nodes { id } } variants(first: 1) { nodes { id } } }
         userErrors { field message code }
       }
     }`;
   const variant: Record<string, unknown> = {
     optionValues: [{ optionName: "Title", name: "Default Title" }],
-    price: "0.00",
+    price: p.price ?? "0.00",
     // In-store only: no stock counting, and not shippable (so it can never be sent in an online order).
-    inventoryItem: { tracked: false, requiresShipping: false },
+    inventoryItem: { tracked: false, requiresShipping: !!p.requiresShipping },
   };
+  if (p.bundle) variant.requiresComponents = true;
   if (p.stock && p.stock.quantity > 0) {
     // Counted stock: tracking on, and the invoice quantity as the starting count at the chosen location.
-    variant.inventoryItem = { tracked: true, requiresShipping: false };
+    variant.inventoryItem = { tracked: true, requiresShipping: !!p.requiresShipping };
     variant.inventoryQuantities = [{ locationId: p.stock.locationId, name: "available", quantity: Math.floor(p.stock.quantity) }];
   }
   if (p.barcode) variant.barcode = p.barcode;
   if (p.sku) variant.sku = p.sku;
 
-  type R = { productSet: { product: { id: string; media?: { nodes: { id: string }[] } } | null; userErrors: { field: string[] | null; message: string }[] } };
+  type R = { productSet: { product: { id: string; media?: { nodes: { id: string }[] }; variants?: { nodes: { id: string }[] } } | null; userErrors: { field: string[] | null; message: string }[] } };
   try {
     const input: Record<string, unknown> = {
       title: p.title,
-      status: "ACTIVE",
+      status: p.status ?? "ACTIVE",
       productOptions: [{ name: "Title", values: [{ name: "Default Title" }] }],
       variants: [variant],
     };
     if (p.vendor) input.vendor = p.vendor;
+    if (p.productType) input.productType = p.productType;
     if (p.description?.trim()) input.descriptionHtml = textToHtml(p.description);
     const photos = (p.photos ?? []).slice(0, 12);
     // Copies made from the catalogue's photo (Shopify downloads it from its own CDN), not links to it.
@@ -322,23 +349,43 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
     }
 
     let published = false;
-    if (ctx.posPublicationId) {
+    const channels = p.online ? ctx.publicationIds : ctx.posPublicationId ? [ctx.posPublicationId] : [];
+    if (channels.length) {
       type P = { publishablePublish: { userErrors: { message: string }[] } };
       const pub = await gql<P>(
         env,
         `mutation Pub($id: ID!, $input: [PublicationInput!]!) {
            publishablePublish(id: $id, input: $input) { userErrors { message } }
          }`,
-        { id: product.id, input: [{ publicationId: ctx.posPublicationId }] },
+        { id: product.id, input: channels.map((publicationId) => ({ publicationId })) },
       );
       published = pub.publishablePublish.userErrors.length === 0;
     }
     // The product's own photo copies, in the order the photos were sent (one per catalogue photo).
     const mediaIds = input.files ? (product.media?.nodes ?? []).map((m) => m.id).slice(0, photos.length) : [];
-    return { ok: true, productId: product.id, published, photos: input.files ? photos.length : 0, mediaIds, ...(photoError ? { photoError } : {}) };
+    return { ok: true, productId: product.id, variantId: product.variants?.nodes?.[0]?.id ?? null, published, photos: input.files ? photos.length : 0, mediaIds, ...(photoError ? { photoError } : {}) };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
+}
+
+/**
+ * Which of these products still exist in the store (a product deleted by hand is gone). Reads only: one request
+ * per 100 products, at most 10 requests; products beyond that are reported as present (unknown).
+ */
+export async function productsPresent(env: Env, productIds: string[]): Promise<Set<string>> {
+  const ids = [...new Set(productIds)];
+  const present = new Set<string>();
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    if (i >= 1000) {
+      for (const id of chunk) present.add(id);
+      continue;
+    }
+    const data = await gql<{ nodes: ({ id: string } | null)[] }>(env, `query Present($ids: [ID!]!) { nodes(ids: $ids) { ... on Product { id } } }`, { ids: chunk });
+    for (const n of data.nodes) if (n?.id) present.add(n.id);
+  }
+  return present;
 }
 
 /* ------------------------------------------------------------------ suppliers */
@@ -518,7 +565,7 @@ export type StockResult = { ok: true; turnedOnTracking: boolean } | { ok: false;
 type UE = { field: string[] | null; message: string }[];
 
 /** Several mutations in one request: m0, m1, ... Returns each one's userErrors. */
-async function manyMutations(env: Env, calls: string[]): Promise<UE[]> {
+export async function manyMutations(env: Env, calls: string[]): Promise<UE[]> {
   if (!calls.length) return [];
   const body = calls.map((c, i) => `m${i}: ${c}`).join("\n");
   const data = await gql<Record<string, { userErrors: UE }>>(env, `mutation { ${body} }`);

@@ -138,6 +138,21 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
   if (url.includes("myshopify.com")) {
     const { query, variables } = JSON.parse(init.body);
     await sleep(120);
+    if (query.includes("query Helium")) {
+      const inflation = { id: "gid://shopify/Product/9000", title: "Helium Inflation", productType: "Service", variants: { nodes: [
+        { id: "gid://shopify/ProductVariant/9040", title: "40-50cm", price: "6.00" },
+        { id: "gid://shopify/ProductVariant/9050", title: "50-80cm", price: "8.00" },
+        { id: "gid://shopify/ProductVariant/9080", title: "80-100cm", price: "12.00" },
+        { id: "gid://shopify/ProductVariant/9100", title: "100-110cm", price: "15.00" },
+      ] } };
+      if (query.includes("query HeliumSizes")) return Response.json({ data: { nodes: variables.ids.map((id: string) => (id === inflation.id ? inflation : null)) } });
+      return Response.json({ data: { bundles: { nodes: [] }, named: { nodes: [{ id: inflation.id, title: inflation.title, productType: inflation.productType }] } } });
+    }
+    if (query.includes("query Titles")) return Response.json({ data: { products: { nodes: [] } } });
+    if (query.includes("productVariantRelationshipBulkUpdate")) {
+      console.log(`[demo] bundle ${variables.input[0].parentProductVariantId} = ${variables.input[0].productVariantRelationshipsToCreate.map((c: { id: string }) => c.id).join(" + ")}`);
+      return Response.json({ data: { productVariantRelationshipBulkUpdate: { parentProductVariants: [], userErrors: [] } } });
+    }
     const filesReply = filesApi(query, variables);
     if (filesReply) return filesReply;
     if (query.includes("Stock($ids")) {
@@ -152,6 +167,23 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
         },
       });
     }
+    if (query.includes("Present($ids")) {
+      return Response.json({ data: { nodes: variables.ids.map((id: string) => (store.some((v) => v.product.id === id) ? { id } : null)) } });
+    }
+    if (query.includes("Prices($ids") || query.includes("V($ids")) {
+      const withPrice = query.includes("Prices($ids");
+      return Response.json({
+        data: {
+          nodes: variables.ids.map((id: string) => {
+            const v = store.find((x) => x.product.id === id);
+            if (!v) return null;
+            const price = (created[id] as any)?.price ?? "0.00";
+            const ph = `/__demo/product-photo/${id.split("/").pop()}.svg`;
+            return { id, title: v.product.title, status: v.product.status ?? "ACTIVE", featuredMedia: Number(id.split("/").pop()) % 7 === 3 ? null : { preview: { image: { small: ph, large: ph } } }, variants: { nodes: [{ id: `${id}/v`, price, sku: v.sku, barcode: v.barcode }] } };
+          }).map((n: any) => (n && !withPrice ? { id: n.id, variants: n.variants } : n)),
+        },
+      });
+    }
     if (query.includes("Status($ids")) {
       return Response.json({ data: { nodes: variables.ids.map((id: string) => { const v = store.find((x) => x.product.id === id); return v ? { id, status: v.product.status ?? "ACTIVE" } : null; }) } });
     }
@@ -161,6 +193,11 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
         const v = store.find((x) => x.product.id === m[2]);
         if (v) v.product.status = "ACTIVE";
         console.log(`[demo] made active: ${v?.product.title}`);
+        data[`m${m[1]}`] = { userErrors: [] };
+      }
+      for (const m of query.matchAll(/m(\d+): productVariantsBulkUpdate\(productId: "([^"]+)", variants: \[\{id: "[^"]+", price: "([^"]+)"\}\]/g)) {
+        if (created[m[2]!]) (created[m[2]!] as any).price = m[3];
+        console.log(`[demo] price set to ${m[3]}: ${store.find((x) => x.product.id === m[2])?.product.title}`);
         data[`m${m[1]}`] = { userErrors: [] };
       }
       for (const m of query.matchAll(/m(\d+): publishablePublish\(id: "([^"]+)"/g)) {
@@ -215,6 +252,7 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
         },
       });
     }
+    if (query.includes("productVariantsCount")) return Response.json({ data: { productVariantsCount: { count: store.length } } });
     if (query.includes("productVariants") && variables?.q) {
       const terms = String(variables.q).split(" OR ").map((t: string) => t.replace("barcode:", ""));
       return Response.json({ data: { productVariants: { nodes: store.filter((v) => v.barcode && terms.includes(v.barcode)) } } });
@@ -275,8 +313,9 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
       store[store.length - 1]!.vendor = input.vendor;
       const media = (input.files ?? []).map(() => ({ id: `gid://shopify/MediaImage/${++fileSeq}` }));
       for (const m of media) demoFiles.set(m.id, { bytes: null, type: "image/svg+xml", label: "copy", created: 0, fails: false, productId: id } as DemoFile);
+      console.log(`[demo]   type=${input.productType ?? "-"} status=${input.status} price=${input.variants[0].price} ship=${input.variants[0].inventoryItem?.requiresShipping} bundle=${!!input.variants[0].requiresComponents}`);
       console.log(`[demo] created ${input.title} | vendor=${input.vendor} | import_source=${input.metafields?.[0]?.value} | tags=${input.tags} | photos=${input.files?.length ?? 0} | description=${input.descriptionHtml ? "yes" : "no"}`);
-      return Response.json({ data: { productSet: { product: { id, media: { nodes: media } }, userErrors: [] } } });
+      return Response.json({ data: { productSet: { product: { id, media: { nodes: media }, variants: { nodes: [{ id: id.replace("Product", "ProductVariant") }] } }, userErrors: [] } } });
     }
     if (query.includes("publishablePublish")) return Response.json({ data: { publishablePublish: { userErrors: [] } } });
   }
@@ -445,6 +484,24 @@ http
       if (!f) return res.writeHead(404).end();
       res.writeHead(200, { "Content-Type": f.bytes ? f.type : "image/svg+xml", "Cache-Control": "max-age=3600" });
       return res.end(f.bytes ?? standIn(f.label));
+    }
+    // Demo only: a stand-in product photo, different for each product.
+    const pp = /^\/__demo\/product-photo\/(\d+)\.svg$/.exec(url.pathname);
+    if (pp) {
+      const n = Number(pp[1]);
+      const hues = [48, 350, 205, 140, 280, 20, 180];
+      const hue = hues[n % hues.length];
+      const label = String(n % 10);
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400"><rect width="400" height="400" fill="#f6f5f2"/><ellipse cx="200" cy="372" rx="90" ry="10" fill="#0001"/><path d="M200 330 C200 350 196 360 204 372" stroke="#9aa0a6" stroke-width="3" fill="none"/><text x="200" y="300" text-anchor="middle" font-family="Arial Black,Arial" font-weight="900" font-size="300" fill="hsl(${hue} 70% 55%)" stroke="hsl(${hue} 60% 38%)" stroke-width="6">${label}</text><ellipse cx="150" cy="110" rx="18" ry="40" fill="#fff8" transform="rotate(-20 150 110)"/></svg>`;
+      res.writeHead(200, { "Content-Type": "image/svg+xml", "Cache-Control": "max-age=3600" });
+      return res.end(svg);
+    }
+    // Demo only: delete a product "in Shopify admin", by title, without telling the tool.
+    if (url.pathname === "/__demo/delete-product") {
+      const title = url.searchParams.get("title") ?? "";
+      const at = store.findIndex((v) => v.product.title === title);
+      if (at >= 0) store.splice(at, 1);
+      return res.writeHead(200).end(at >= 0 ? "deleted" : "not found");
     }
     if (url.pathname.startsWith("/api/")) {
       if (url.pathname === "/api/extract-file" && /long/i.test(decodeURIComponent(String(req.headers["x-file-name"] ?? "")))) LONG_PDF.active = true;

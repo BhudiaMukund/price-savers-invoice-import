@@ -285,7 +285,12 @@ export interface ProductWithoutPhotos {
 }
 
 /** Store products with no photo at all (first variant's barcode and SKU), for filling gaps from catalogues. */
-export async function productsWithoutPhotos(env: Env): Promise<ProductWithoutPhotos[]> {
+/**
+ * Store products with no photo, read `pages` × 250 products from `after` (a Shopify cursor; "" for the start).
+ * A big store is read over several calls: the free Workers plan stops a call at 50 requests. Newest first, so
+ * products just added from invoices come up straight away.
+ */
+export async function productsWithoutPhotos(env: Env, after = "", pages = 4): Promise<{ products: ProductWithoutPhotos[]; scanned: number; next: string | null }> {
   type R = {
     products: {
       pageInfo: { hasNextPage: boolean; endCursor: string | null };
@@ -300,27 +305,29 @@ export async function productsWithoutPhotos(env: Env): Promise<ProductWithoutPho
     };
   };
   const out: ProductWithoutPhotos[] = [];
-  let cursor: string | null = null;
-  for (let page = 0; page < 40; page++) {
+  let cursor: string | null = after || null;
+  let scanned = 0;
+  for (let page = 0; page < pages; page++) {
     const data: R = await gql<R>(
       env,
       `query P($cursor: String) {
-         products(first: 250, after: $cursor) {
+         products(first: 250, after: $cursor, sortKey: ID, reverse: true) {
            pageInfo { hasNextPage endCursor }
            nodes { id title handle vendor featuredMedia { id } variants(first: 1) { nodes { barcode sku } } }
          }
        }`,
       { cursor },
     );
+    scanned += data.products.nodes.length;
     for (const p of data.products.nodes) {
       if (p.featuredMedia) continue;
       const v = p.variants.nodes[0];
       out.push({ productId: p.id, title: p.title, handle: p.handle, vendor: p.vendor ?? "", barcode: v?.barcode ?? "", sku: v?.sku ?? "" });
     }
-    if (!data.products.pageInfo.hasNextPage) break;
+    if (!data.products.pageInfo.hasNextPage) return { products: out, scanned, next: null };
     cursor = data.products.pageInfo.endCursor;
   }
-  return out;
+  return { products: out, scanned, next: cursor };
 }
 
 /** Cheap check that the app can see Files (i.e. has the read_files scope). */

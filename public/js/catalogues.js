@@ -9,6 +9,7 @@ import { detectSupplier } from "./supplier-detect.js";
 import { topText } from "./sheet-read.js";
 import { describe, keepOf, loadLibrary, packThumb, sameOnProduct, tidyLibrary } from "./lookalike.js";
 import { maybeSame, sameByThumb } from "./phash.js";
+import { checkSummary, createPhotoReview, runPhotoCheck } from "./photo-updates.js";
 
 const MAX_FILE_BYTES = 400 * 1024 * 1024;
 const MAX_PHOTO_BYTES = 20 * 1024 * 1024;
@@ -177,6 +178,7 @@ export function createCatalogues(ctx) {
 
   async function loadList({ reset = true } = {}) {
     renderBanner($("#cat-banner"));
+    if (reset) review.refreshCounts();
     if (reset) tidy();
     const seq = ++list.seq;
     if (reset) list.next = null;
@@ -824,6 +826,8 @@ export function createCatalogues(ctx) {
       const swaps = upgrades.filter((u) => fileOf.get(u.fp)).map((u) => ({ from: u.from, to: fileOf.get(u.fp) }));
       for (let i = 0; i < swaps.length; i += 25) tally.upgraded += (await api.mergePhotos(swaps.slice(i, i + 25)).catch(() => ({ merged: 0 }))).merged;
       const res = await api.finishCatalogue(code);
+      // Products already in the store may get a sharper or newer photo from this catalogue.
+      setTimeout(() => betterPhotos({ mode: "upload", code: res.upload.code }, { quiet: true }), 30_000);
       wiz.step = "done";
       wiz.resume = null;
       wiz.result = { upload: res.upload, ...tally };
@@ -859,9 +863,24 @@ export function createCatalogues(ctx) {
     box.hidden = false;
     if (!again) box.replaceChildren(h("p", { class: "wiz-wait" }, h("span", { class: "spinner" }), "Looking through your store for products without photos…"));
     try {
-      const res = await api.missingPhotos();
+      // The store is read a slice at a time; collect every slice, then show the list.
+      const res = { checked: 0, found: [], waiting: [] };
+      const seen = new Set();
+      let after = "";
+      let scanned = 0;
+      for (let guard = 0; guard < 200; guard++) {
+        const part = await api.missingPhotos(after);
+        res.checked += part.checked;
+        scanned += part.scanned ?? 0;
+        for (const f of part.found) if (!seen.has(f.product.productId)) (seen.add(f.product.productId), res.found.push(f));
+        res.waiting.push(...(part.waiting ?? []));
+        if (!part.next) break;
+        after = part.next;
+        if (!again) box.replaceChildren(h("p", { class: "wiz-wait" }, h("span", { class: "spinner" }), `Looking through your store for products without photos… ${scanned.toLocaleString("en-AU")} checked so far.`));
+      }
       missing = {
         checked: res.checked,
+        scanned,
         rows: res.found.map((f) => {
           const ready = f.match.photos.filter((p) => p.status === "ready");
           return { ...f, chosen: f.match.mixed ? [] : ready.map((p) => p.fileId), include: !f.match.mixed, status: null };
@@ -896,9 +915,9 @@ export function createCatalogues(ctx) {
       h(
         "p",
         {},
-        `Checked ${plural(missing.checked, "product")} in your store without a photo`,
+        `Looked through all ${fmt(missing.scanned ?? 0)} products in your store: ${fmt(missing.checked)} ${missing.checked === 1 ? "has" : "have"} no photo`,
         missing.rows.some((r) => r.stripped) || missing.waiting.length ? ", and every product whose photos were removed with a catalogue" : "",
-        `. ${missing.rows.length ? "Each gets its own copy of the catalogue's photos." : "None of them are in a catalogue with photos yet."}`,
+        `. ${missing.rows.length ? "Each gets its own copy of the catalogue's photos." : "None of them match a catalogue item (by barcode, or supplier code for the same supplier) that has a ready photo."}`,
       ),
     );
     const waiting = missing.waiting.length
@@ -1122,11 +1141,92 @@ export function createCatalogues(ctx) {
     $("#cu-items").replaceChildren();
     $("#cu-q").value = "";
     $("#cu-failed").hidden = true;
+    $("#cu-check-row").hidden = true;
     $("#cu-undo").hidden = true;
     renderBanner($("#cu-banner"));
     await refreshUpload();
     loadItems({ reset: true });
     tidy();
+  }
+
+  /** Ask Shopify about every photo still marked processing, a page at a time. */
+  async function checkPhotos() {
+    const code = page.code;
+    const btn = $("#cu-check");
+    const note = $("#cu-check-note");
+    if (!code || btn.disabled) return;
+    btn.disabled = true;
+    let after = 0;
+    const t = { checked: 0, ready: 0, failed: 0, gone: 0, waiting: 0 };
+    try {
+      for (let guard = 0; guard < 100; guard++) {
+        note.textContent = `Checking… ${fmt(t.checked)} done: ${fmt(t.ready)} ready, ${fmt(t.failed + t.gone)} not saved, ${fmt(t.waiting)} still waiting.`;
+        const r = await api.checkPhotos(code, after);
+        for (const k of Object.keys(t)) t[k] += r[k] ?? 0;
+        if (r.next == null) break;
+        after = r.next;
+      }
+      const bad = t.failed + t.gone;
+      note.textContent = `${fmt(t.checked)} checked: ${fmt(t.ready)} ready, ${fmt(t.waiting)} still processing, ${fmt(bad)} never saved by Shopify${bad ? ". Use “Try the failed photos again” below." : "."}`;
+    } catch (err) {
+      if (err instanceof SessionExpired) return ctx.sessionExpired();
+      note.textContent = `Stopped part way: ${errorText(err)} Press the button again to carry on.`;
+    } finally {
+      btn.disabled = false;
+      page.polls = 0;
+      await refreshUpload();
+      loadItems({ reset: true, keepScroll: true });
+    }
+  }
+
+  /** Try every failed photo again through the server, a few at a time, then say what happened. */
+  async function retryFailed() {
+    const code = page.code;
+    const btn = $("#cu-retry");
+    const note = $("#cu-retry-note");
+    if (!code || btn.disabled) return;
+    btn.disabled = true;
+    let after = 0;
+    const total = { fixed: 0, notFixed: 0 };
+    const reasons = new Map();
+    try {
+      // A few photos per call. When a call is cut off (big photos take the free Cloudflare plan past its limits),
+      // try one at a time, and if a single photo still can't be done, skip it with a note and carry on.
+      let size = 10;
+      let calm = 0;
+      for (let guard = 0; guard < 2000; guard++) {
+        note.textContent = `Trying again… ${fmt(total.fixed)} fixed, ${fmt(total.notFixed)} can't be fixed so far.`;
+        let r;
+        try {
+          r = await api.retryFailedPhotos(code, after, size);
+          if (size === 1 && ++calm >= 5) (size = 10), (calm = 0);
+        } catch (err) {
+          if (!(err instanceof ApiError) || err.body?.code !== "busy") throw err;
+          calm = 0;
+          if (size > 1) {
+            size = 1;
+            continue;
+          }
+          r = await api.retryFailedPhotos(code, after, 1, true);
+        }
+        total.fixed += r.fixed;
+        total.notFixed += r.notFixed;
+        for (const [why, n] of Object.entries(r.reasons ?? {})) reasons.set(why, (reasons.get(why) ?? 0) + n);
+        if (r.next == null) break;
+        after = r.next;
+      }
+      const why = [...reasons].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([m, n]) => `${fmt(n)}× ${m}`).join(" ");
+      note.textContent = `${fmt(total.fixed)} sent to Shopify again${total.notFixed ? `, ${fmt(total.notFixed)} can't be fixed. ${why}` : ""}.`;
+      toast(total.notFixed ? "info" : "ok", `${fmt(total.fixed)} photos sent again. Shopify processes them in the background${total.notFixed ? `; ${fmt(total.notFixed)} can't be fixed (reasons are in the list).` : "."}`);
+    } catch (err) {
+      if (err instanceof SessionExpired) return ctx.sessionExpired();
+      note.textContent = `Stopped part way: ${errorText(err)} Press the button again to carry on.`;
+    } finally {
+      btn.disabled = false;
+      page.polls = 0;
+      await refreshUpload();
+      loadItems({ reset: true, keepScroll: true });
+    }
   }
 
   async function refreshUpload() {
@@ -1153,6 +1253,7 @@ export function createCatalogues(ctx) {
         banner.replaceChildren(h("span", { class: "callout-icon" }, icon("alert", 18)), h("p", {}, `Undone by ${person(u.undoneBy)} ${fmtWhen(u.undoneAt)}. It's no longer used for invoices. Press Remove catalogue to take it off the list.`));
       } else renderBanner(banner);
       $("#cu-undo").hidden = false; // also finishes removing an older, undone upload
+      $("#cu-check-row").hidden = !ph.processing;
       const failed = $("#cu-failed");
       failed.hidden = !u.failed?.length;
       if (u.failed?.length) {
@@ -1326,6 +1427,8 @@ export function createCatalogues(ctx) {
       pick.value = "";
     });
     $("#cat-missing-find").addEventListener("click", findMissing);
+    $("#cat-better-run").addEventListener("click", () => betterPhotos({ mode: "all" }));
+    $("#cat-better-review").addEventListener("click", () => review.open());
     let t = 0;
     $("#cat-q").addEventListener("input", () => {
       clearTimeout(t);
@@ -1339,6 +1442,54 @@ export function createCatalogues(ctx) {
     });
     $("#cu-more").addEventListener("click", () => loadItems());
     $("#cu-undo").addEventListener("click", removeUpload);
+    $("#cu-retry").addEventListener("click", retryFailed);
+    $("#cu-check").addEventListener("click", checkPhotos);
+  }
+
+  /* ============================================================ better photos */
+
+  const review = createPhotoReview(ctx);
+  let checking = null;
+
+  /**
+   * Look for sharper or newer catalogue photos for products already in the store, and swap them in.
+   * `quiet`: started on its own (after a catalogue); says something only if it changed photos.
+   */
+  async function betterPhotos(scope, { quiet = false } = {}) {
+    if (checking) return checking;
+    const btn = $("#cat-better-run");
+    const note = $("#cat-better-note");
+    btn.disabled = true;
+    let lastChanged = 0;
+    checking = (async () => {
+      try {
+        const t = await runPhotoCheck(api, scope, {
+          progress: (t) => {
+            // The review button counts up as photos change, not just at the end.
+            const changed = t.sharper + t.newer;
+            if (changed !== lastChanged) {
+              lastChanged = changed;
+              review.refreshCounts();
+            }
+            note.textContent = `Checking… ${fmt(t.scanned)} products looked at, ${fmt(t.compared)} photos compared. ${t.sharper || t.newer ? checkSummary(t, plural) : ""}`;
+          },
+        });
+        note.textContent = `${scope.mode === "all" ? `All ${fmt(t.scanned)} products checked. ` : ""}${checkSummary(t, plural)}${t.unreadable ? ` ${plural(t.unreadable, "photo")} couldn't be read, so ${t.unreadable === 1 ? "it was" : "they were"} left as ${t.unreadable === 1 ? "it was" : "they were"}.` : ""}`;
+        if (!quiet || t.sharper || t.newer) {
+          toast(t.newer ? "info" : "ok", `Better photos: ${checkSummary(t, plural)}`, t.newer ? { action: ["Review", () => (ctx.navigate("/catalogues"), setTimeout(() => review.open(), 300))] } : {});
+        }
+        await review.refreshCounts();
+        return t;
+      } catch (err) {
+        if (err instanceof SessionExpired) return ctx.sessionExpired();
+        note.textContent = `Stopped part way: ${errorText(err)} Press Check all products to carry on.`;
+        return null;
+      } finally {
+        btn.disabled = false;
+        checking = null;
+      }
+    })();
+    return checking;
   }
 
   function leave() {
@@ -1346,5 +1497,5 @@ export function createCatalogues(ctx) {
     page.code = null;
   }
 
-  return { wire, loadList, showUpload, startUpload, busy, leave, photoPicker, photoTile, renderBanner: () => renderBanner($("#cat-banner")) };
+  return { wire, loadList, showUpload, startUpload, busy, leave, photoPicker, photoTile, betterPhotos, openPhotoReview: () => review.open(), renderBanner: () => renderBanner($("#cat-banner")) };
 }

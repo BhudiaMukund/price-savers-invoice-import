@@ -11,10 +11,11 @@ import {
   createProduct,
   listLocations,
   stockError,
-  fetchStoreProducts,
+  countVariants,
   findVariantsByBarcodes,
   getShopContext,
   listSuppliers,
+  productsPresent,
   removeSupplier,
   supplierDetails,
   ShopifyError,
@@ -31,7 +32,12 @@ import { RUN_CODE_RE, RunStore, StoreError } from "./store";
 import { catalogueRoutes, type AppEnv } from "./catalogue-routes";
 import { CatalogueStore, FILE_ID_RE } from "./catalogue";
 import { filesAccess } from "./files";
+import { MAX_PRICE_BATCH, fetchPrices, normalisePrice, setPrices } from "./pricing";
 import { canManage, readSettings, writeSettings, admins } from "./settings";
+import { BALLOON_TYPE, BUNDLE_TYPE, dropBundle, findInflation, linkBundle, repriceStoreBundles, syncBalloons, titlesInStore, type Inflation } from "./helium";
+// @ts-expect-error plain JS module shared with the browser
+import { bundlePrice, bundleTitle } from "../public/js/helium.js";
+import { BUNDLE_WEIGHT } from "./limits";
 import { supplierMatchKey } from "./catalogue";
 
 const app = new Hono<AppEnv>();
@@ -60,8 +66,14 @@ type ClientItem = ExtractedItem & {
   description?: string | null;
   /** Whole units of stock the invoice line adds (null: not known). */
   qty?: number | null;
+  /** Price including GST ("4.95"), or null to add the product at $0.00. */
+  price?: string | null;
   /** Which invoice this is ("supplier|number"), so the same invoice can't add its stock twice. Empty without a number. */
   invoiceRef?: string;
+  /** A foil balloon: posted online once priced, typed "Foil Balloons". */
+  foil?: boolean;
+  /** Make a helium bundle with this size of the Helium Inflation product (its variant ID). */
+  helium?: string | null;
 };
 
 /** What makes "this invoice adds stock to this product" the same thing twice. */
@@ -79,6 +91,8 @@ const NO_DB =
   "Run history isn't set up: the D1 database is missing. Create it with npx wrangler d1 create invoice-import-db, put its database_id in wrangler.toml, and deploy again.";
 
 
+
+const VARIANT_ID_RE = /^gid:\/\/shopify\/ProductVariant\/\d+$/;
 
 /** Coerce client-sent rows into the shape we expect; drop anything else. */
 function readItems(body: unknown, max: number): ClientItem[] | null {
@@ -99,6 +113,9 @@ function readItems(body: unknown, max: number): ClientItem[] | null {
       description: typeof r.description === "string" ? r.description.trim().slice(0, 5000) || null : null,
       qty: Number.isInteger(r.qty) && (r.qty as number) >= 0 && (r.qty as number) <= 100_000 ? (r.qty as number) : null,
       invoiceRef: str(r.invoiceRef, 120),
+      price: normalisePrice(r.price),
+      foil: r.foil === true,
+      helium: typeof r.helium === "string" && VARIANT_ID_RE.test(r.helium) ? r.helium : null,
     };
   });
 }
@@ -141,6 +158,7 @@ app.get("/api/health", async (c) => {
     runs: Boolean(env.DB),
     runsError: env.DB ? null : NO_DB,
     maxCreateBatch: MAX_CREATE_BATCH,
+    bundleWeight: BUNDLE_WEIGHT,
     maxUndoBatch: MAX_UNDO_BATCH,
     importTags: env.IMPORT_TAGS !== "false",
     files: shopify && !filesError,
@@ -153,19 +171,18 @@ app.get("/api/health", async (c) => {
 
 /** Size of the live catalogue, for the "store checked" line in the UI. */
 app.get("/api/store", async (c) => {
-  const store = await fetchStoreProducts(c.env);
-  return c.json({
-    variants: store.length,
-    withBarcode: store.filter((p) => analyzeBarcode(p.barcode).digits).length,
-    checkedAt: new Date().toISOString(),
-  });
+  // One count, not the whole catalogue: paging through every variant needs a request per 250 of them, and
+  // the free Workers plan stops a call at 50 requests.
+  return c.json({ variants: await countVariants(c.env), checkedAt: new Date().toISOString() });
 });
 
 async function matchAgainstStore(env: Env, items: ExtractedItem[]) {
-  const store = await fetchStoreProducts(env);
+  // Look up only the barcodes on this invoice. Reading the whole catalogue costs a request per 250 variants and
+  // breaks once the store is big (Workers free plan: 50 requests per call).
+  const found = await findVariantsByBarcodes(env, items.map((i) => i.barcode));
   return {
-    rows: classifyItems(items, buildStoreIndex(store)),
-    store: { variants: store.length, checkedAt: new Date().toISOString() },
+    rows: classifyItems(items, buildStoreIndex(found)),
+    store: { variants: await countVariants(env), checkedAt: new Date().toISOString() },
   };
 }
 
@@ -277,6 +294,10 @@ app.post("/api/create", async (c) => {
   const items = readItems(body, MAX_CREATE_BATCH);
   if (!items) return c.json({ error: `Send at most ${MAX_CREATE_BATCH} rows at a time.` }, 400);
   if (items.length === 0) return c.json({ error: "Nothing to create." }, 400);
+  const bundled = items.filter((i) => i.helium).length;
+  if (items.length + bundled * (BUNDLE_WEIGHT - 1) > MAX_CREATE_BATCH) {
+    return c.json({ error: `Too many helium bundles in one go. Send at most ${Math.floor(MAX_CREATE_BATCH / BUNDLE_WEIGHT)} balloons with bundles at a time.` }, 400);
+  }
 
   // Every product must belong to a run and an invoice, so it can be traced and undone later.
   const store = runStore(c.env);
@@ -301,6 +322,20 @@ app.post("/api/create", async (c) => {
   // Catalogue photos: only ones Shopify has finished processing (they have a CDN address).
   const photoIds = [...new Set(items.flatMap((i) => i.photos ?? []))];
   const files = photoIds.length ? await new CatalogueStore(c.env.DB!).filesById(photoIds) : new Map();
+
+  // Helium bundles: the inflation sizes (read live, for their prices) and which bundle titles already exist.
+  let inflation: Inflation | null = null;
+  let takenTitles = new Set<string>();
+  const wantBundles = rows.filter((r) => r.match !== "exists" && r.match !== "duplicate_in_invoice" && r.title && (items.find((i) => i.id === r.id) ?? items[rows.indexOf(r)])?.helium);
+  if (wantBundles.length) {
+    try {
+      inflation = await findInflation(c.env);
+      takenTitles = await titlesInStore(c.env, wantBundles.map((r) => bundleTitle(r.title) as string));
+    } catch (e) {
+      console.error("helium", e);
+    }
+  }
+  const balloons: Parameters<RunStore["recordBalloons"]>[0] = [];
 
   const results = [];
   const ledger: Parameters<RunStore["recordProducts"]>[0] = [];
@@ -335,8 +370,57 @@ app.post("/api/create", async (c) => {
       photos: namedPhotos(row.title, usedPhotos.map((f) => f.url!)),
       description: src?.description ?? null,
       tags: settings.importTags,
+      price: src?.price ?? undefined,
       stock: updateStock && src?.qty && src.qty > 0 ? { quantity: src.qty, locationId: stockLocationId } : undefined,
+      // A foil balloon can be posted, and goes on every channel once it has a price (POS only while at $0).
+      ...(src?.foil ? { productType: BALLOON_TYPE, requiresShipping: true, online: !!src.price } : {}),
     });
+    let bundle: { status: "created"; productId: string } | { status: "skipped"; reason: string } | { status: "failed"; error: string } | undefined;
+    let bundleRow: { bundleId: string; bundleVariantId: string; tierVariantId: string } | null = null;
+    if (r.ok && src?.helium) {
+      const tier = inflation?.tiers.find((t) => t.variantId === src.helium);
+      const title: string = bundleTitle(row.title);
+      if (!inflation) bundle = { status: "failed", error: "The Helium Inflation product wasn't found in Shopify, so no bundle was made." };
+      else if (!tier) bundle = { status: "failed", error: "That helium size isn't on the Helium Inflation product any more. Reload the page." };
+      else if (takenTitles.has(title)) bundle = { status: "skipped", reason: `“${title}” is already in the store.` };
+      else if (!r.variantId) bundle = { status: "failed", error: "Shopify didn't return the balloon's variant." };
+      else {
+        const b = await createProduct(c.env, ctx, {
+          title,
+          barcode: null,
+          sku: null,
+          vendor: src.vendor ?? null,
+          importId: src.importId ?? null,
+          runCode,
+          photos: namedPhotos(title, usedPhotos.map((f) => f.url!)),
+          description: src.description ?? null,
+          tags: settings.importTags,
+          // Waits as a $0 draft until the balloon is priced: then it's balloon + inflation and goes live.
+          price: src.price ? bundlePrice(src.price, tier.price) : "0.00",
+          status: src.price ? "ACTIVE" : "DRAFT",
+          online: true,
+          productType: BUNDLE_TYPE,
+          requiresShipping: true,
+          bundle: true,
+        });
+        if (!b.ok || !b.variantId) bundle = { status: "failed", error: b.ok ? "Shopify didn't return the bundle's variant." : b.error };
+        else {
+          const linkError = await linkBundle(c.env, b.variantId, r.variantId, tier.variantId);
+          if (linkError) {
+            // A bundle with no parts would sell nothing but helium: take it out again.
+            await dropBundle(c.env, b.productId).catch((e) => console.error("drop bundle", e));
+            bundle = { status: "failed", error: `The bundle couldn't be linked to the balloon: ${linkError}` };
+          } else {
+            bundle = { status: "created", productId: b.productId };
+            bundleRow = { bundleId: b.productId, bundleVariantId: b.variantId, tierVariantId: tier.variantId };
+            takenTitles.add(title);
+          }
+        }
+      }
+    }
+    if (r.ok && src?.foil) {
+      balloons.push({ productId: r.productId, importId: src.importId!, runId, bundleId: bundleRow?.bundleId ?? null, bundleVariantId: bundleRow?.bundleVariantId ?? null, tierVariantId: bundleRow?.tierVariantId ?? null, online: !!src.price });
+    }
     if (r.ok && updateStock && src?.qty && src.qty > 0) {
       stockLedger.push({ key: stockKey({ ...src, barcode, title: row.title }), runId, importId: src.importId!, productId: r.productId, barcode, qty: src.qty, locationId: stockLocationId, kind: "created" });
     }
@@ -356,7 +440,7 @@ app.post("/api/create", async (c) => {
     }
     results.push(
       r.ok
-        ? { id: row.id, status: "created" as const, productId: r.productId, publishedToPos: r.published, photos: r.photos, photoError: r.photoError, stock: updateStock ? (src?.qty ?? 0) : 0 }
+        ? { id: row.id, status: "created" as const, productId: r.productId, publishedToPos: r.published, photos: r.photos, photoError: r.photoError, stock: updateStock ? (src?.qty ?? 0) : 0, ...(bundle ? { bundle } : {}) }
         : { id: row.id, status: "failed" as const, error: r.error },
     );
   }
@@ -372,6 +456,11 @@ app.post("/api/create", async (c) => {
     await store.claimStock(stockLedger, c.get("user")); // only a record: the stock went in with the product
   } catch (e) {
     console.error("stock ledger", e);
+  }
+  try {
+    await store.recordBalloons(balloons);
+  } catch (e) {
+    console.error("balloon ledger", e);
   }
   try {
     await store.recordProducts(ledger, c.get("user"));
@@ -528,6 +617,96 @@ app.post("/api/suppliers", async (c) => {
   }
 });
 
+/* ------------------------------------------------------------------ prices */
+
+/**
+ * A page of the products this tool added (one run, or every run), with their current prices from Shopify.
+ * Only prices are read; nothing here touches stock. `after` continues from the previous page's `next`.
+ */
+app.get("/api/pricing", async (c) => {
+  const store = runStore(c.env);
+  if (!store) return c.json({ error: NO_DB }, 503);
+  const run = c.req.query("run") ?? "";
+  if (run && !RUN_CODE_RE.test(run)) return c.json({ error: "That run code isn't valid." }, 400);
+  const after = Math.max(0, Math.floor(Number(c.req.query("after") ?? 0)) || 0);
+  const page = await store.liveProducts(run, after, MAX_PRICE_BATCH);
+  const prices = new Map((await fetchPrices(c.env, page.rows.map((r) => r.productId))).map((p) => [p.productId, p]));
+  const products = page.rows.flatMap((r) => {
+    const p = prices.get(r.productId);
+    // A product deleted in Shopify by hand has nothing to price.
+    return p ? [{ ...p, vendor: r.vendor ?? "", run: r.run, title: p.title || r.title }] : [];
+  });
+  return c.json({ products, next: page.next });
+});
+
+/** Set prices (GST included) on products this tool added. Price only: stock and everything else stay as they are. */
+app.post("/api/prices", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const raw = (body as { items?: unknown })?.items;
+  if (!Array.isArray(raw) || !raw.length || raw.length > MAX_PRICE_BATCH) return c.json({ error: `Send between 1 and ${MAX_PRICE_BATCH} prices at a time.` }, 400);
+  const store = runStore(c.env);
+  if (!store) return c.json({ error: NO_DB }, 503);
+  const items: { productId: string; price: string }[] = [];
+  const bad: { productId: string; ok: false; error: string }[] = [];
+  for (const r of raw as Record<string, unknown>[]) {
+    const productId = typeof r?.productId === "string" ? r.productId : "";
+    if (!/^gid:\/\/shopify\/Product\/\d+$/.test(productId)) continue;
+    const price = normalisePrice(r.price);
+    if (price) items.push({ productId, price });
+    else bad.push({ productId, ok: false, error: "Enter a price above $0, like 4.95." });
+  }
+  const own = await store.liveOwn(items.map((i) => i.productId));
+  const allowed = items.filter((i) => own.has(i.productId));
+  const refused = items.filter((i) => !own.has(i.productId)).map((i) => ({ productId: i.productId, ok: false as const, error: "This product wasn't added by this tool, so its price can't be set here." }));
+  const saved = allowed.length ? await setPrices(c.env, allowed) : [];
+  // Foil balloons just priced: on to every channel, and their helium bundles priced and made live.
+  let balloons = null;
+  const pricedBalloons = await store.balloonsFor(saved.filter((r) => r.ok).map((r) => r.productId));
+  if (pricedBalloons.length) {
+    try {
+      balloons = await syncBalloons(c.env, await getShopContext(c.env), store, pricedBalloons);
+    } catch (e) {
+      balloons = { error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  return c.json({ results: [...saved, ...refused, ...bad], balloons });
+});
+
+/** The Helium Inflation product and its sizes, for suggesting bundles on the review screen. */
+app.get("/api/helium", async (c) => {
+  try {
+    return c.json({ inflation: await findInflation(c.env) });
+  } catch (e) {
+    return c.json({ inflation: null, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+/**
+ * Bring every foil balloon this tool added up to date, 40 at a time (send `after` from the last reply until `next`
+ * is null): balloons priced at the till go on every channel, and helium bundles get balloon + inflation (also
+ * after an inflation price changes).
+ */
+app.post("/api/balloons/sync", async (c) => {
+  const store = runStore(c.env);
+  if (!store) return c.json({ error: NO_DB }, 503);
+  const body = await c.req.json<{ after?: unknown }>().catch(() => null);
+  const after = Math.max(0, Math.floor(Number(body?.after ?? 0)) || 0);
+  const page = await store.balloonsPage(after, 40);
+  const out = page.rows.length ? await syncBalloons(c.env, await getShopContext(c.env), store, page.rows) : { checked: 0, online: 0, repriced: 0, waiting: 0, gone: 0, errors: [] };
+  return c.json({ ...out, next: page.next });
+});
+
+/** Every helium bundle in the store, 50 at a time: price = the sum of its parts. See repriceStoreBundles. */
+app.post("/api/bundles/reprice", async (c) => {
+  const body = await c.req.json<{ after?: unknown }>().catch(() => null);
+  const after = typeof body?.after === "string" ? body.after.slice(0, 500) : "";
+  try {
+    return c.json(await repriceStoreBundles(c.env, after));
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : String(e) }, 502);
+  }
+});
+
 /**
  * Undo an import: delete its products. Only products whose import_source holds this import ID and whose
  * price is still $0.00 are deleted; anything already priced is kept.
@@ -544,9 +723,30 @@ app.post("/api/undo", async (c) => {
   // Only products the ledger says this import created (and that are still there) can be deleted.
   const known = await store.liveInImport(importId, ids);
   const results: UndoResult[] = ids.filter((id) => !known.has(id)).map((id) => ({ id, status: "kept", reason: "not_this_import" }));
-  if (known.size) results.push(...(await undoImport(c.env, importId, [...known])));
+  // Helium bundles go first: a balloon is only deleted once its bundle is gone, so no bundle is left pointing at nothing.
+  const balloonRows = await store.balloonsFor([...known]);
+  const bundleOf = new Map(balloonRows.filter((b) => b.bundleId).map((b) => [b.productId, b.bundleId!]));
+  const blocked = new Map<string, UndoResult>();
+  if (bundleOf.size) {
+    const bundleResults = await undoImport(c.env, importId, [...bundleOf.values()]);
+    const byBundle = new Map(bundleResults.map((r) => [r.id, r]));
+    for (const [base, bundleId] of bundleOf) {
+      const r = byBundle.get(bundleId);
+      if (!r || r.status === "deleted" || (r.status === "kept" && r.reason === "gone")) continue;
+      blocked.set(
+        base,
+        r.status === "kept" && r.reason === "priced"
+          ? { id: base, status: "kept", reason: "priced" }
+          : { id: base, status: "failed", error: `Its helium bundle couldn't be removed${r.status === "failed" ? `: ${r.error}` : "."}` },
+      );
+    }
+  }
+  results.push(...blocked.values());
+  const free = [...known].filter((id) => !blocked.has(id));
+  if (free.length) results.push(...(await undoImport(c.env, importId, free)));
   const gone = results.filter((r) => r.status === "deleted" || (r.status === "kept" && r.reason === "gone")).map((r) => r.id);
   await store.markDeleted(gone, c.get("user"));
+  await store.markBalloonsDeleted(gone).catch((e) => console.error("balloon ledger", e));
   await new CatalogueStore(c.env.DB!).markProductsGone(gone, c.get("user")).catch((e) => console.error("photos ledger", e));
   const order = new Map(ids.map((id, i) => [id, i]));
   results.sort((a, b) => order.get(a.id)! - order.get(b.id)!);
@@ -648,6 +848,53 @@ app.put("/api/runs/:code", async (c) => {
   } catch (e) {
     return storeErrorResponse(e);
   }
+});
+
+/**
+ * Compare a run's products with what is really in Shopify. Products deleted by hand are marked gone, so they
+ * stop blocking the invoice and the run. `productIds` are existing products this page added stock to: any that
+ * no longer exist are reported as missing. Read-only on Shopify.
+ */
+app.post("/api/runs/:code/check", async (c) => {
+  const store = runStore(c.env);
+  if (!store) return c.json({ error: NO_DB }, 503);
+  const code = c.req.param("code");
+  const runId = RUN_CODE_RE.test(code) ? await store.runId(code) : null;
+  if (!runId) return c.json({ error: "Run not found." }, 404);
+  const body = await c.req.json().catch(() => null);
+  const extra = Array.isArray(body?.productIds) ? (body.productIds as unknown[]).filter((x): x is string => typeof x === "string" && /^gid:\/\/shopify\/Product\/\d+$/.test(x)).slice(0, 200) : [];
+  const live = await store.liveForRun(runId);
+  if (!live.length && !extra.length) return c.json({ removedIds: [], missingIds: [], remaining: [], liveByInvoice: {} });
+  let present: Set<string>;
+  try {
+    present = await productsPresent(c.env, [...live.map((l) => l.productId), ...extra]);
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : "Shopify couldn't be reached." }, 502);
+  }
+  const removed = live.filter((l) => !present.has(l.productId));
+  const missingIds = extra.filter((id) => !present.has(id));
+  const gone = [...new Set([...removed.map((r) => r.productId), ...missingIds])];
+  if (gone.length) {
+    await store.markDeleted(gone, c.get("user"));
+    await new CatalogueStore(c.env.DB!).markProductsGone(gone, c.get("user")).catch((e) => console.error("photos ledger", e));
+  }
+  const remaining = live.filter((l) => present.has(l.productId));
+  const liveByInvoice: Record<string, number> = {};
+  for (const r of remaining) liveByInvoice[r.invoiceId] = (liveByInvoice[r.invoiceId] ?? 0) + 1;
+  return c.json({ removedIds: removed.map((r) => r.productId), missingIds, remaining, liveByInvoice });
+});
+
+/** Let an invoice leave a run while its products stay in Shopify: they just stop being tracked as part of it. */
+app.post("/api/runs/:code/release", async (c) => {
+  const store = runStore(c.env);
+  if (!store) return c.json({ error: NO_DB }, 503);
+  const code = c.req.param("code");
+  const runId = RUN_CODE_RE.test(code) ? await store.runId(code) : null;
+  if (!runId) return c.json({ error: "Run not found." }, 404);
+  const body = await c.req.json().catch(() => null);
+  const invoiceId = typeof body?.invoiceId === "string" ? body.invoiceId : "";
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(invoiceId)) return c.json({ error: "That invoice isn't valid." }, 400);
+  return c.json({ released: await store.releaseInvoice(runId, invoiceId, c.get("user")) });
 });
 
 app.delete("/api/runs/:code", async (c) => {

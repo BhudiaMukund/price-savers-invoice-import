@@ -90,6 +90,64 @@ export interface PhotoInfo {
   url: string | null;
 }
 
+export interface PhotoUpdateRow {
+  id?: number;
+  productId: string;
+  title?: string | null;
+  fileId: string;
+  kind: "sharper" | "new" | "none";
+  status: string;
+  oldMediaId?: string | null;
+  oldUrl?: string | null;
+  oldSize?: string | null;
+  newMediaId?: string | null;
+  newUrl?: string | null;
+  newSize?: string | null;
+  catalogue?: string | null;
+  error?: string | null;
+  createdAt?: string;
+  decidedAt?: string | null;
+  decidedBy?: string | null;
+}
+type PhotoUpdateDb = {
+  id: number;
+  product_id: string;
+  product_title: string | null;
+  file_id: string;
+  kind: "sharper" | "new" | "none";
+  status: string;
+  old_media_id: string | null;
+  old_url: string | null;
+  old_size: string | null;
+  new_media_id: string | null;
+  new_url: string | null;
+  new_size: string | null;
+  catalogue: string | null;
+  error: string | null;
+  created_at: string;
+  decided_at: string | null;
+  decided_by: string | null;
+};
+const toPhotoUpdate = (r: PhotoUpdateDb): PhotoUpdateRow & { id: number } => ({
+  id: Number(r.id),
+  productId: r.product_id,
+  title: r.product_title,
+  fileId: r.file_id,
+  kind: r.kind,
+  status: r.status,
+  oldMediaId: r.old_media_id,
+  oldUrl: r.old_url,
+  oldSize: r.old_size,
+  newMediaId: r.new_media_id,
+  newUrl: r.new_url,
+  newSize: r.new_size,
+  catalogue: r.catalogue,
+  error: r.error,
+  createdAt: r.created_at,
+  decidedAt: r.decided_at,
+  decidedBy: r.decided_by,
+});
+
 export interface CatalogueMatch {
   itemId: number;
   catalogue: string;
@@ -289,6 +347,63 @@ export class CatalogueStore {
       }
     }
     return failed;
+  }
+
+  /**
+   * Photos Shopify downloaded but couldn't process (they are attached to products), with the link each came from.
+   * A page at a time: `after` is the last row number of the previous page.
+   */
+  async failedLinkFiles(uploadId: number, after: number, limit: number): Promise<{ rid: number; fileId: string; source: string }[]> {
+    await this.ready();
+    const { results } = await this.db
+      .prepare(
+        `SELECT rowid AS rid, file_id AS fileId, source FROM catalogue_files
+          WHERE upload_id = ? AND status = 'failed' AND file_id NOT LIKE 'failed:%' AND source LIKE 'http%' AND rowid > ?
+          ORDER BY rowid LIMIT ?`,
+      )
+      .bind(uploadId, after, limit)
+      .all<{ rid: number; fileId: string; source: string }>();
+    return results;
+  }
+
+  /** The catalogue product a photo belongs to, with its place among that product's photos (for naming it). */
+  async itemForFile(fileId: string): Promise<{ title: string; code: string; barcode: string; position: number; count: number } | null> {
+    await this.ready();
+    return this.db
+      .prepare(
+        `SELECT i.title AS title, i.code AS code, i.barcode AS barcode, p.position AS position,
+                (SELECT COUNT(*) FROM catalogue_photos q WHERE q.item_id = i.id) AS count
+           FROM catalogue_photos p JOIN catalogue_items i ON i.id = p.item_id WHERE p.file_id = ? ORDER BY i.id LIMIT 1`,
+      )
+      .bind(fileId)
+      .first<{ title: string | null; code: string | null; barcode: string | null; position: number; count: number }>()
+      .then((r) => (r ? { title: r.title ?? "", code: r.code ?? "", barcode: r.barcode ?? "", position: Number(r.position), count: Number(r.count) } : null));
+  }
+
+  /** Photos the database still lists as processing, by row, so a long list can be checked page by page. */
+  async processingPage(uploadId: number, after: number, limit: number): Promise<{ rid: number; fileId: string; createdAt: string }[]> {
+    await this.ready();
+    const { results } = await this.db
+      .prepare(
+        `SELECT rowid AS rid, file_id AS fileId, created_at AS createdAt FROM catalogue_files
+          WHERE upload_id = ? AND status = 'processing' AND file_id LIKE 'gid:%' AND rowid > ? ORDER BY rowid LIMIT ?`,
+      )
+      .bind(uploadId, after, limit)
+      .all<{ rid: number; fileId: string; createdAt: string }>();
+    return results;
+  }
+
+  /** Mark photos failed with a reason, so "Try the failed photos again" picks them up. */
+  async failFiles(fileIds: string[], error: string) {
+    if (!fileIds.length) return;
+    await this.ready();
+    await this.db.batch(fileIds.map((id) => this.db.prepare(`UPDATE catalogue_files SET status = 'failed', error = ? WHERE file_id = ? AND status = 'processing'`).bind(error.slice(0, 500), id)));
+  }
+
+  /** Replace a failed photo's message with the real reason found when it was tried again. */
+  async setFailedReason(fileId: string, error: string) {
+    await this.ready();
+    await this.db.prepare(`UPDATE catalogue_files SET error = ? WHERE file_id = ? AND status = 'failed'`).bind(error.slice(0, 500), fileId).run();
   }
 
   /** A photo that never reached Shopify (bad link, expired link). Kept so staff see what failed. */
@@ -597,7 +712,7 @@ export class CatalogueStore {
 
   /* ---------------------------------------------------------------- photos on store products */
 
-  async recordAttachments(rows: { productId: string; title: string; mediaId: string | null; fileId: string; source: "invoice" | "fill" }[], user: string) {
+  async recordAttachments(rows: { productId: string; title: string; mediaId: string | null; fileId: string; source: "invoice" | "fill" | "update" }[], user: string) {
     if (!rows.length) return;
     await this.ready();
     const t = now();
@@ -607,6 +722,124 @@ export class CatalogueStore {
           .prepare(`INSERT INTO product_photos (product_id, product_title, media_id, file_id, source, attached_at, attached_by) VALUES (?, ?, ?, ?, ?, ?, ?)`)
           .bind(r.productId, r.title.slice(0, 255), r.mediaId, r.fileId, r.source, t, user),
       ),
+    );
+  }
+
+  /* ---------------------------------------------------------------- photo updates */
+
+  /** Which catalogue photos each of these products already has (live copies), and which file each copy came from. */
+  async photosOnProducts(productIds: string[]): Promise<{ files: Map<string, Set<string>>; mediaFile: Map<string, string> }> {
+    await this.ready();
+    const files = new Map<string, Set<string>>();
+    const mediaFile = new Map<string, string>();
+    for (let i = 0; i < productIds.length; i += IN_CHUNK) {
+      const part = productIds.slice(i, i + IN_CHUNK);
+      const { results } = await this.db
+        .prepare(`SELECT product_id, media_id, file_id FROM product_photos WHERE removed_at IS NULL AND product_id IN (${part.map(() => "?").join(",")})`)
+        .bind(...part)
+        .all<{ product_id: string; media_id: string | null; file_id: string }>();
+      for (const r of results) {
+        if (!files.has(r.product_id)) files.set(r.product_id, new Set());
+        files.get(r.product_id)!.add(r.file_id);
+        if (r.media_id) mediaFile.set(r.media_id, r.file_id);
+      }
+    }
+    return { files, mediaFile };
+  }
+
+  /** Product + catalogue photo pairs already looked at (whatever came of it). */
+  async photoPairsSeen(productIds: string[]): Promise<Set<string>> {
+    await this.ready();
+    const out = new Set<string>();
+    for (let i = 0; i < productIds.length; i += IN_CHUNK) {
+      const part = productIds.slice(i, i + IN_CHUNK);
+      const { results } = await this.db
+        .prepare(`SELECT product_id, file_id FROM photo_updates WHERE product_id IN (${part.map(() => "?").join(",")})`)
+        .bind(...part)
+        .all<{ product_id: string; file_id: string }>();
+      for (const r of results) out.add(`${r.product_id}|${r.file_id}`);
+    }
+    return out;
+  }
+
+  /** Fingerprints, sizes and dates of catalogue photos. */
+  async fileDetails(fileIds: string[]): Promise<Map<string, { sig: string | null; pixels: number | null; createdAt: string; catalogue: string | null }>> {
+    await this.ready();
+    const out = new Map<string, { sig: string | null; pixels: number | null; createdAt: string; catalogue: string | null }>();
+    for (let i = 0; i < fileIds.length; i += IN_CHUNK) {
+      const part = fileIds.slice(i, i + IN_CHUNK);
+      const { results } = await this.db
+        .prepare(
+          `SELECT f.file_id, f.sig, f.pixels, f.created_at, u.code AS catalogue FROM catalogue_files f LEFT JOIN catalogue_uploads u ON u.id = f.upload_id
+            WHERE f.file_id IN (${part.map(() => "?").join(",")})`,
+        )
+        .bind(...part)
+        .all<{ file_id: string; sig: string | null; pixels: number | null; created_at: string; catalogue: string | null }>();
+      for (const r of results) out.set(r.file_id, { sig: r.sig, pixels: r.pixels === null ? null : Number(r.pixels), createdAt: r.created_at, catalogue: r.catalogue });
+    }
+    return out;
+  }
+
+  async addPhotoUpdate(u: PhotoUpdateRow, user: string): Promise<number | null> {
+    await this.ready();
+    const res = await this.db
+      .prepare(
+        `INSERT OR IGNORE INTO photo_updates (product_id, product_title, file_id, kind, status, old_media_id, old_url, old_size, new_media_id, new_url, new_size, catalogue, error, created_at, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(u.productId, (u.title ?? "").slice(0, 255), u.fileId, u.kind, u.status, u.oldMediaId ?? null, u.oldUrl ?? null, u.oldSize ?? null, u.newMediaId ?? null, u.newUrl ?? null, u.newSize ?? null, u.catalogue ?? null, u.error ?? null, now(), user)
+      .run();
+    return res.meta.changes ? Number(res.meta.last_row_id) : null;
+  }
+
+  async photoUpdate(id: number): Promise<(PhotoUpdateRow & { id: number }) | null> {
+    await this.ready();
+    const r = await this.db.prepare(`SELECT * FROM photo_updates WHERE id = ?`).bind(id).first<PhotoUpdateDb>();
+    return r ? toPhotoUpdate(r) : null;
+  }
+
+  async setPhotoUpdateStatus(id: number, status: string, user: string, error: string | null = null) {
+    await this.ready();
+    await this.db.prepare(`UPDATE photo_updates SET status = ?, decided_at = ?, decided_by = ?, error = COALESCE(?, error) WHERE id = ?`).bind(status, now(), user, error, id).run();
+  }
+
+  /**
+   * Changes to show. "review": new photos put in front of an older one, waiting for someone to look. "recent": every
+   * change, newest first. A page at a time (`before` is the last id of the previous page).
+   */
+  async photoUpdates(view: "review" | "recent", before: number, limit: number, productIds?: string[]) {
+    await this.ready();
+    const where = [view === "review" ? `kind = 'new' AND status = 'applied'` : `status != 'none'`, before ? `id < ?` : `1`];
+    const args: unknown[] = before ? [before] : [];
+    if (productIds?.length) {
+      where.push(`product_id IN (${productIds.map(() => "?").join(",")})`);
+      args.push(...productIds);
+    }
+    const { results } = await this.db
+      .prepare(`SELECT * FROM photo_updates WHERE ${where.join(" AND ")} ORDER BY id DESC LIMIT ?`)
+      .bind(...args, limit + 1)
+      .all<PhotoUpdateDb>();
+    const rows = results.slice(0, limit).map(toPhotoUpdate);
+    return { rows, next: results.length > limit ? rows[rows.length - 1]!.id : null };
+  }
+
+  async photoUpdateCounts() {
+    await this.ready();
+    const r = await this.db
+      .prepare(
+        `SELECT SUM(kind = 'new' AND status = 'applied') AS review, SUM(kind = 'sharper' AND status = 'applied') AS sharper, SUM(kind = 'new' AND status != 'none') AS newer FROM photo_updates`,
+      )
+      .first<{ review: number | null; sharper: number | null; newer: number | null }>();
+    return { review: Number(r?.review ?? 0), sharper: Number(r?.sharper ?? 0), newer: Number(r?.newer ?? 0) };
+  }
+
+  /** A copy taken off a product (swapped for a sharper one, or put back). */
+  async markMediaRemoved(mediaIds: string[], reason: string, user: string) {
+    if (!mediaIds.length) return;
+    await this.ready();
+    const t = now();
+    await this.db.batch(
+      mediaIds.map((m) => this.db.prepare(`UPDATE product_photos SET removed_at = ?, removed_by = ?, removed_reason = ? WHERE media_id = ? AND removed_at IS NULL`).bind(t, user, reason, m)),
     );
   }
 

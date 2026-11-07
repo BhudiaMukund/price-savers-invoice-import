@@ -6,10 +6,13 @@ import { findExisting, makeImportId, matchSupplier } from "./suppliers.js";
 import { createCatalogues, thumb } from "./catalogues.js";
 import { sameSupplier, supplierPicker } from "./supplier-picker.js";
 import { createSettings } from "./settings.js";
+import { createPricing, parsePrice, splitPasted } from "./pricing.js";
 import { createReader, MAX_ROWS_PER_RUN, titleKey } from "./invoice-reader.js";
 import { topText } from "./sheet-read.js";
 import { detectSupplier } from "./supplier-detect.js";
 import { resolveQuantity } from "./quantity.js";
+import { heliumSuggestion } from "./helium.js";
+import { checkSummary, runPhotoCheck } from "./photo-updates.js";
 
 /* =============================================================== state */
 
@@ -28,6 +31,7 @@ const state = {
   sourceFilter: null,
   query: "",
   health: null,
+  helium: null, // { found, title, tiers: [{ variantId, title, price, min, max }] } once read from Shopify
   store: null, // { variants, checkedAt }
   creating: null, // { done, total }
   stock: true, // this run adds the invoice quantities to stock (switch on the review screen)
@@ -62,11 +66,15 @@ function makeRow(fields) {
     photos: [], // catalogue photo file IDs to use, main photo first
     photosTouched: false, // staff changed the photo choice by hand
     useDescription: true,
+    price: "", // price including GST for a new product ("4.95"); empty adds it at $0.00 to be priced later
     qty: null, // whole units of stock this line adds (when "Update stock from invoices" is on), or null if not known
     qtyNote: "", // how the quantity was worked out ("6 × 12"), or why it needs a look
     qtyCheck: false, // the quantity needs checking before the line is added
     stockResult: null, // { status: "added", qty } | { status: "failed", error }
     catKey: "", // what the catalogue was last checked for (barcode | code | supplier)
+    barcodeFrom: "", // supplier whose catalogue gave this line its barcode (the invoice had none), or ""
+    barcodeTouched: false, // staff typed or cleared the barcode: the catalogue never fills it in again
+    heliumSet: null, // staff's own choice for the helium bundle { on, tier }; null follows the suggestion from the title
     ...fields,
   };
 }
@@ -264,6 +272,7 @@ function render() {
   $("#cat-page").hidden = v !== "catalogues";
   $("#catalogue-page").hidden = v !== "catalogue";
   $("#settings-page").hidden = v !== "settings";
+  $("#price-page").hidden = v !== "prices";
   renderCrumbs();
   if (v !== "run") $("#sources").replaceChildren();
   if (v === "run") {
@@ -415,7 +424,7 @@ function paintSourceCard(li, src, snap) {
   const live = liveCount(src);
   rm.disabled = !!state.creating || !!state.undoing;
   rm.classList.toggle("is-locked", live > 0);
-  rm.title = live ? `Has ${plural(live, "product")} in Shopify. Undo the import before removing it.` : "Remove from this run";
+  rm.title = live ? "Its products or stock are in Shopify. Undo the import first, or remove it and keep them." : "Remove from this run";
   rm.setAttribute("aria-label", live ? `${src.name} can't be removed: ${plural(live, "product")} in Shopify` : `Remove ${src.name} from this run`);
 
   // Supplier, invoice number, import ID, undo
@@ -467,7 +476,8 @@ function paintSourceCard(li, src, snap) {
       ),
     );
   }
-  if (added && src.importId) {
+  const stockedN = stockedCount(src);
+  if ((added || stockedN) && src.importId) {
     acts.push(
       h(
         "button",
@@ -477,7 +487,7 @@ function paintSourceCard(li, src, snap) {
           disabled: !!state.creating || !!state.undoing,
           onclick: () => undoImport(src),
         },
-        state.undoing === src.id ? "Undoing…" : `Undo import (${added})`,
+        state.undoing === src.id ? "Undoing…" : added ? `Undo import (${added + stockedN})` : `Take back stock (${stockedN})`,
       ),
     );
   }
@@ -506,10 +516,77 @@ function renderSupplierOptions() {
 /** A product already in the store that this invoice added stock to (and that hasn't been taken back). */
 const stockedRow = (r) => r.result?.status !== "created" && r.stockResult?.status === "added" && r.stockResult.qty > 0;
 
-/** Products from this invoice that are in Shopify: what this page knows, or what the server's ledger says. */
-function liveCount(src) {
-  const here = sourceRows(src).filter((r) => r.result?.status === "created" || stockedRow(r)).length;
+/** Products this invoice added to Shopify (what this page knows, or what the server's ledger says). */
+function madeCount(src) {
+  const here = sourceRows(src).filter((r) => r.result?.status === "created").length;
   return Math.max(here, state.run?.liveByInvoice?.[src.id] ?? 0);
+}
+
+/** Older products already in the store that this invoice added stock to. Nothing is deleted for these. */
+const stockedCount = (src) => sourceRows(src).filter(stockedRow).length;
+
+/** Everything this invoice has put into Shopify: new products, and stock on existing ones. */
+const liveCount = (src) => madeCount(src) + stockedCount(src);
+
+/**
+ * Compare this run with what is really in Shopify. Products deleted by hand there stop counting as "in Shopify",
+ * so they no longer stop an invoice or the run being removed. Returns how many were found gone (null if it
+ * couldn't check).
+ */
+async function syncLive({ announce = false } = {}) {
+  const run = state.run;
+  if (!run || state.creating || state.undoing) return null;
+  const known = state.rows.filter((r) => r.result?.status === "created" && r.result.productId).map((r) => r.result.productId);
+  const stocked = state.rows.filter(stockedRow).map((r) => r.inStore?.productId).filter(Boolean);
+  if (!known.length && !stocked.length && !Object.keys(run.liveByInvoice ?? {}).length) return 0;
+  try {
+    const res = await api.checkRun(run.code, [...new Set([...known, ...stocked])].slice(0, 200));
+    if (state.run !== run) return null;
+    const gone = new Set([...res.removedIds, ...res.missingIds]);
+    for (const row of state.rows) {
+      const created = row.result?.status === "created" && gone.has(row.result.productId);
+      if (created || (stockedRow(row) && gone.has(row.inStore?.productId))) {
+        Object.assign(row, { result: null, stockResult: null, selected: false, inStore: null, checked: true });
+      }
+    }
+    run.liveByInvoice = res.liveByInvoice;
+    render();
+    if (gone.size && announce) toast("ok", `${plural(gone.size, "product")} ${gone.size === 1 ? "was" : "were"} deleted in Shopify, so ${gone.size === 1 ? "it no longer counts" : "they no longer count"} as part of this run.`);
+    return gone.size;
+  } catch (err) {
+    if (err instanceof SessionExpired) sessionExpired();
+    else if (announce) toast("bad", `Couldn't check Shopify. ${errorText(err)}`);
+    return null;
+  }
+}
+
+/** The invoice has put things into Shopify: say exactly what, and offer to let the invoice go while they stay. */
+async function offerRelease(src) {
+  const made = madeCount(src);
+  const stocked = stockedCount(src);
+  const ok = await confirmDialog({
+    title: `Remove ${src.name} from this run?`,
+    ok: made ? "Remove, keep the products" : "Remove, keep the stock",
+    danger: true,
+    facts: [
+      made ? fact("alert", `${plural(made, "product")} this invoice added to Shopify ${made === 1 ? "is" : "are"} still there. `, "Shopify was just checked, so they do exist in your store.") : null,
+      stocked
+        ? fact("scan", `${plural(stocked, "older product")} already in your store got stock from this invoice. `, "Nothing is deleted for these: Undo import only takes the quantities back out.")
+        : null,
+      fact("trash", `To ${made ? "delete or " : ""}take back what this invoice added, cancel and use ${made ? "Undo import" : "Take back stock"}. `, made ? "Undo keeps any product that already has a price." : "If some have sold since, their count goes lower."),
+      fact("hand", `Removing the invoice anyway leaves ${made ? "the products and stock" : "the stock"} in Shopify, `, "no longer linked to this run. This invoice still can't add the same stock twice.", true),
+    ].filter(Boolean),
+  });
+  if (!ok) return;
+  try {
+    await api.releaseInvoice(state.run.code, src.id);
+    state.run.liveByInvoice = { ...state.run.liveByInvoice, [src.id]: 0 };
+    for (const r of sourceRows(src)) r.stockResult = null; // these rows are leaving the run
+    for (const r of sourceRows(src)) if (r.result?.status === "created") r.result = null;
+  } catch (err) {
+    return toast("bad", `Couldn't remove it. ${errorText(err)}`);
+  }
+  return removeSource(src, { force: true });
 }
 
 /**
@@ -517,16 +594,12 @@ function liveCount(src) {
  * products are still in Shopify: they'd lose their link to the run, so they must be deleted first
  * (Undo import). The server enforces the same rule.
  */
-async function removeSource(src) {
+async function removeSource(src, { force = false } = {}) {
   if (state.creating || state.undoing) return;
-  const live = liveCount(src);
-  if (live) {
-    toast(
-      "info",
-      `${src.name} has ${plural(live, "product")} in Shopify, so it stays in this run. To remove it, use Undo import to delete ${live === 1 ? "that product" : "those products"} first.`,
-      { id: `locked-${src.id}` },
-    );
-    return;
+  if (!force && liveCount(src)) {
+    // Products deleted by hand in Shopify no longer count: check what is really there before refusing.
+    await syncLive();
+    if (liveCount(src)) return offerRelease(src);
   }
   const rows = sourceRows(src);
   src.cancelled = true; // if it's still being read, ignore the result
@@ -539,7 +612,7 @@ async function removeSource(src) {
   const wasReading = src.state === "reading" || src.state === "queued";
   toast("info", `Removed ${src.name} from the list.`, {
     id: `removed-${src.id}`,
-    action: wasReading
+    action: wasReading || force
       ? null
       : [
           "Undo",
@@ -685,11 +758,78 @@ function itemNote(row, status) {
   if (status === "duplicate" && stockOn() && row.qty > 0 && !row.qtyCheck) return `${fmt(row.qty)} added to the first line`;
   if (row.stockResult?.status === "failed") return `Stock not added: ${row.stockResult.error}`;
   if (row.activateError) return `Couldn't make it active: ${row.activateError}`;
+  if (row.photoUpdate?.kind === "new") return "Newer photo from the catalogue added: review it on Catalogues";
+  if (row.photoUpdate?.kind === "sharper") return "Sharper photo from the catalogue swapped in";
   if (row.activated) return "Was a draft. Now active";
   if (status === "exists" && needsActivation(row)) return "A draft in your store. It'll be made active";
   if (status === "exists" && row.inStore.title.trim().toLowerCase() !== row.title.trim().toLowerCase()) return `As “${row.inStore.title}”`;
+  if (row.barcodeFrom && status === "ready") return `Barcode from the ${row.barcodeFrom} catalogue`;
   if (row.barcodeNote && status === "ready") return "Leading zero restored";
   return null;
+}
+
+/**
+ * The price a new product is added at, editable in the row: "Price $[4.95]". GST included; left empty the
+ * product is added at $0.00 and priced later from the Set prices page. Enter moves to the next line, and a column
+ * pasted from a spreadsheet fills the lines below.
+ */
+function priceControl(row, status) {
+  if (row.inStore || row.result?.status === "created" || ["duplicate", "invalid", "adding", "added"].includes(status)) return null;
+  const bad = row.price.trim() !== "" && parsePrice(row.price) === null;
+  const input = h("input", {
+    type: "text",
+    inputmode: "decimal",
+    class: `price-in${bad ? " is-check" : ""}`,
+    placeholder: "0.00",
+    value: row.price,
+    autocomplete: "off",
+    "data-row": row.id,
+    "aria-label": `Price including GST for ${row.title.trim() || "this product"}`,
+    disabled: !!state.creating,
+  });
+  for (const ev of ["click", "dblclick"]) input.addEventListener(ev, (e) => e.stopPropagation());
+  const commit = (value) => {
+    const v = parsePrice(value);
+    row.price = v ?? String(value).trim();
+    return v;
+  };
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const v = commit(input.value);
+    if (v) input.value = v;
+    input.classList.toggle("is-check", row.price !== "" && !v);
+    saveDraft();
+    const all = [...document.querySelectorAll("#list .price-in:not(:disabled)")];
+    const next = all[all.indexOf(input) + (e.shiftKey ? -1 : 1)];
+    if (next) (next.focus(), next.select());
+  });
+  input.addEventListener("change", () => {
+    const v = commit(input.value);
+    if (v) input.value = v;
+    input.classList.toggle("is-check", row.price !== "" && !v);
+    saveDraft();
+  });
+  input.addEventListener("paste", (e) => {
+    const parts = splitPasted(e.clipboardData?.getData("text") ?? "");
+    if (parts.length < 2) return;
+    e.preventDefault();
+    const all = [...document.querySelectorAll("#list .price-in:not(:disabled)")];
+    const start = all.indexOf(input);
+    parts.forEach((txt, k) => {
+      const el = all[start + k];
+      if (!el || txt === "") return;
+      const r = state.rows.find((x) => x.id === el.dataset.row);
+      if (!r) return;
+      const v = parsePrice(txt);
+      r.price = v ?? txt;
+      el.value = r.price;
+      el.classList.toggle("is-check", !v);
+    });
+    saveDraft();
+  });
+  return h("label", { class: `qty-wrap price-wrap${bad ? " is-check" : ""}`, title: bad ? "Enter a price like 4.95" : "Price customers pay, GST included. Leave empty to add at $0.00 and set it later." }, "Price $", input);
 }
 
 /** The stock this line adds, editable in the row: "Stock + [12]". Only when stock updates are on. */
@@ -730,6 +870,60 @@ function qtyControl(row, status) {
   );
 }
 
+/* ---------------------------------------------------------- helium bundles */
+
+async function loadHelium() {
+  try {
+    const { inflation } = await api.helium();
+    state.helium = inflation ? { found: true, title: inflation.title, tiers: inflation.tiers } : { found: false, title: "", tiers: [] };
+  } catch {
+    state.helium = null; // asked again next time the page loads
+  }
+  if (state.view === "run") render();
+}
+
+/** What will happen for this line: { foil, bundle, tier }. Staff's own choice wins over the title's suggestion. */
+function heliumFor(row) {
+  const sug = heliumSuggestion(row.title, state.helium?.tiers ?? [], { code: row.supplierCode, invoiceTitle: row.invoiceTitle, catalogueTitle: row.catalogue?.title });
+  if (!row.heliumSet) return sug;
+  return { ...sug, foil: true, bundle: !!(row.heliumSet.on && row.heliumSet.tier), tier: row.heliumSet.tier ?? sug.tier };
+}
+
+const tierLabel = (t) => `${t.title} (+$${t.price})`;
+
+/** "Helium bundle [x] [45-50cm (+$6.00)]" on foil balloon lines, and what happened once added. */
+function heliumControl(row, status) {
+  if (row.result?.status === "created") {
+    const b = row.result.bundle;
+    if (!b) return null;
+    if (b.status === "created") return h("span", { class: "qty-done", title: "Made in Shopify. Its price follows the balloon's price." }, "Helium bundle added");
+    return h("span", { class: "helium-note is-bad", title: b.error ?? b.reason ?? "" }, b.status === "skipped" ? "Helium bundle already in store" : "Helium bundle not made");
+  }
+  if (row.inStore || ["duplicate", "invalid", "adding", "added"].includes(status)) return null;
+  const hl = heliumFor(row);
+  if (!hl.foil) return null;
+  const tiers = state.helium?.tiers ?? [];
+  if (state.helium && !state.helium.found) return h("span", { class: "helium-note", title: "Add a product called Helium Inflation with a variant per balloon size to make bundles." }, "No Helium Inflation product");
+  const box = h("input", { type: "checkbox", "aria-label": `Make a helium bundle for ${row.title.trim() || "this balloon"}`, disabled: !!state.creating || !tiers.length });
+  box.checked = hl.bundle;
+  const pick = h(
+    "select",
+    { class: "helium-tier", "aria-label": "Balloon size for helium", disabled: !!state.creating || !tiers.length },
+    h("option", { value: "" }, tiers.length ? "Choose size" : "Loading sizes…"),
+    ...tiers.map((t) => h("option", { value: t.variantId, selected: t.variantId === hl.tier }, tierLabel(t))),
+  );
+  for (const el of [box, pick]) for (const ev of ["click", "keydown", "dblclick"]) el.addEventListener(ev, (e) => e.stopPropagation());
+  const save = (on, tier) => {
+    row.heliumSet = { on, tier: tier || null };
+    saveDraft();
+    render();
+  };
+  box.addEventListener("change", () => save(box.checked, pick.value || hl.tier));
+  pick.addEventListener("change", () => save(!!pick.value, pick.value));
+  const why = hl.bundle ? "Also adds “Helium INFLATED … Foil Balloon”: balloon + inflation. Untick for air-fill balloons." : hl.size && hl.size < 40 ? `About ${hl.size}cm: too small for helium.` : "Tick and choose a size to add a helium bundle.";
+  return h("label", { class: `qty-wrap helium-wrap${hl.bundle ? " is-on" : ""}`, title: why }, box, "Helium bundle", pick);
+}
+
 function renderItem(row, status, sourceName) {
   const bc = analyzeBarcode(row.barcode);
   const selectable = isSelectable(row, status) && !state.creating;
@@ -753,7 +947,9 @@ function renderItem(row, status, sourceName) {
     row.supplierCode ? h("span", { class: "mono" }, row.supplierCode) : null,
     row.barcode ? h("span", { class: "item-meta-bar mono" }, row.barcode) : null,
     sourceName ? h("span", {}, sourceName) : null,
+    priceControl(row, status),
     qtyControl(row, status),
+    heliumControl(row, status),
   );
 
   const barCell = h("div", { class: `item-bar${status === "invalid" ? " is-bad" : ""}`, role: "gridcell" });
@@ -878,7 +1074,7 @@ function renderActionBar(snap) {
     const missing = sourcesMissingSupplier(chosen);
     count.replaceChildren(
       `${fmt(chosen.length)} selected`,
-      h("small", {}, missing.length ? `Choose a supplier for ${missing[0].name}${missing.length > 1 ? ` and ${missing.length - 1} more` : ""}` : stockOn() ? "New products at $0, in-store only, with stock counted" : "Added at $0, in-store only"),
+      h("small", {}, missing.length ? `Choose a supplier for ${missing[0].name}${missing.length > 1 ? ` and ${missing.length - 1} more` : ""}` : stockOn() ? "New products in-store only, with stock counted" : "Added in-store only"),
     );
     btn.disabled = !state.health?.shopify || state.sessionExpired;
     const existing = chosen.filter((r) => snap.status.get(r.id) === "exists");
@@ -950,10 +1146,17 @@ async function runCatalogue() {
       for (let i = 0; i < rows.length; i += 300) {
         const batch = rows.slice(i, i + 300);
         const { matches } = await api.matchCatalogue(supplier, batch.map(({ id, barcode, supplierCode }) => ({ id, barcode, supplierCode })));
+        let filled = 0;
         for (const r of batch) {
           if (catKeyOf(r) !== keys.get(r)) continue; // edited again meanwhile
-          applyMatch(r, matches[r.id] ?? null);
-          r.catKey = keys.get(r);
+          const m = matches[r.id] ?? null;
+          if (r.result?.status !== "created" && fillBarcodeFromCatalogue(r, m)) filled++;
+          applyMatch(r, m);
+          r.catKey = catKeyOf(r); // the filled barcode leads to the same catalogue item: don't ask again
+        }
+        if (filled) {
+          saveDraft();
+          scheduleLookup(); // is it already in the store?
         }
       }
     }
@@ -972,6 +1175,23 @@ async function runCatalogue() {
       scheduleCatalogue();
     }, 8000);
   }
+}
+
+/**
+ * The invoice line has no barcode but its supplier code matched a catalogue item that has one: use it, so the
+ * store check can find the product if it's already in Shopify (instead of it looking new). Never replaces a
+ * barcode from the invoice, and never refills one staff have cleared.
+ */
+function fillBarcodeFromCatalogue(row, m) {
+  if (!m || m.by !== "code" || row.barcodeTouched || analyzeBarcode(row.barcode).key) return false;
+  const bc = analyzeBarcode(m.barcode);
+  if (bc.status !== "valid") return false;
+  row.barcode = bc.digits;
+  row.barcodeFrom = m.supplier;
+  row.barcodeNote = `The invoice had no barcode. This one is from the ${m.supplier} catalogue (${m.catalogue}), matched by supplier code ${m.code ?? row.supplierCode}.`;
+  row.inStore = null;
+  row.checked = false;
+  return true;
 }
 
 function applyMatch(row, m) {
@@ -1397,6 +1617,8 @@ function wireDrawer() {
     if (!row) return;
     row.barcode = e.target.value.trim();
     row.barcodeNote = "";
+    row.barcodeFrom = "";
+    row.barcodeTouched = true;
     row.inStore = null;
     row.checked = analyzeBarcode(row.barcode).key ? false : true;
     if (row.result?.status === "failed") row.result = null;
@@ -1660,6 +1882,9 @@ function currentRoute() {
   if (p === "/runs") return { view: "runs" };
   if (p === "/catalogues") return { view: "catalogues" };
   if (p === "/settings") return { view: "settings" };
+  if (p === "/prices") return { view: "prices", run: "" };
+  const pr = p.match(/^\/runs\/(R\d+)\/prices$/i);
+  if (pr) return { view: "prices", run: pr[1].toUpperCase() };
   const c = p.match(/^\/catalogues\/(C\d+)$/i);
   if (c) return { view: "catalogue", code: c[1].toUpperCase() };
   const m = p.match(/^\/runs\/(R\d+)$/i);
@@ -1673,13 +1898,14 @@ function busyReading() {
 
 async function navigate(path, { replace = false } = {}) {
   if (path === location.pathname && !replace) return route();
-  const leavingRun = state.view === "run" && !path.startsWith(`/runs/${state.run?.code}`);
+  const leavingRun = state.view === "run" && path.replace(/\/+$/, "") !== `/runs/${state.run?.code}`;
   if (leavingRun) {
     if (state.creating) return toast("info", "Wait until the products have been added.");
     if (busyReading() && !confirm("An invoice is still being read. Leave this run anyway? It will be stopped.")) return;
     await flushSave();
   }
   if (catalogues.busy() && !confirm("A catalogue is still being saved. Leave anyway? It will stop part way.")) return;
+  if (state.view === "prices" && pricingPage.dirty() && !confirm("Some prices are still saving. Leave anyway? They'll finish saving in the background.")) return;
   history[replace ? "replaceState" : "pushState"]({}, "", path);
   route();
 }
@@ -1690,6 +1916,7 @@ async function route() {
     if (state.run?.code === r.code && state.view === "run") return render();
     return openRun(r.code);
   }
+  if (state.view === "prices" && r.view !== "prices") pricingPage.leave();
   if (state.view === "run") resetAll();
   if (state.view === "catalogue" && r.view !== "catalogue") catalogues.leave();
   state.run = null;
@@ -1701,6 +1928,7 @@ async function route() {
   if (r.view === "catalogues") catalogues.loadList();
   if (r.view === "catalogue") catalogues.showUpload(r.code);
   if (r.view === "settings") settingsPage.show();
+  if (r.view === "prices") pricingPage.show({ run: r.run });
   $("#account-menu").hidden = true;
   $("#avatar").setAttribute("aria-expanded", "false");
   window.scrollTo(0, 0);
@@ -1735,6 +1963,7 @@ async function openRun(code, { quiet = false } = {}) {
     render();
     if (state.rows.some((r) => r.checked === false)) scheduleLookup();
     resumeTidying();
+    syncLive({ announce: true }); // products deleted in Shopify since this run was last open
   } catch (err) {
     if (err instanceof SessionExpired) return sessionExpired();
     toast("bad", err instanceof ApiError && err.status === 404 ? `Run ${code} wasn't found.` : `Couldn't open run ${code}. ${errorText(err)}`);
@@ -1774,6 +2003,7 @@ function renderCrumbs() {
   $(".crumb-run-sep").hidden = !code;
   crumb.textContent = code ? `Run ${code}` : "";
   $("#nav-runs").classList.toggle("is-current", state.view === "runs");
+  $("#nav-prices").classList.toggle("is-current", state.view === "prices");
   $("#nav-catalogues").classList.toggle("is-current", state.view === "catalogues" || state.view === "catalogue");
   if (state.view === "catalogue") return; // its page sets the title once loaded
   document.title = code
@@ -1799,6 +2029,10 @@ function renderRunBar(snap) {
   );
   const anyLive = state.sources.some((s) => liveCount(s) > 0);
   $("#run-delete").hidden = anyLive || !!state.creating;
+  const pricesLink = $("#run-prices");
+  pricesLink.hidden = !anyLive;
+  pricesLink.href = `/runs/${run.code}/prices`;
+  $("#run-check").hidden = !anyLive || !!state.creating;
   setSaveState(state.saveState);
 }
 
@@ -2331,7 +2565,7 @@ function confirmDialog({ title, facts, ok, danger = false }) {
   return new Promise((res) => dlg.addEventListener("close", () => res(dlg.returnValue === "ok"), { once: true }));
 }
 
-function confirmAdd(count, noBarcode, groups, withPhotos = 0, stock = null, activate = 0) {
+function confirmAdd(count, noBarcode, groups, withPhotos = 0, stock = null, activate = 0, priced = 0) {
   const what = count === 1 ? "1 product" : `${fmt(count)} products`;
   const stockFact = stock
     ? stock.createUnits || stock.createRows
@@ -2353,7 +2587,11 @@ function confirmAdd(count, noBarcode, groups, withPhotos = 0, stock = null, acti
     ok: `Add ${what}`,
     facts: [
       fact("store", "On Point of Sale straight away. ", "Not on your online store."),
-      fact("alert", "Priced at $0.00. ", "Set prices in the POS app before selling."),
+      priced >= count
+        ? fact("check", `${count === 1 ? "It has" : "All have"} a price. `, "GST included.")
+        : priced
+          ? fact("alert", `${fmt(priced)} priced, ${fmt(count - priced)} at $0.00. `, "Set the rest from the Prices page, or in the POS app, before selling.")
+          : fact("alert", "Priced at $0.00. ", "Set prices from the Prices page, or in the POS app, before selling."),
       stockFact,
       activateFact,
       fact("hand", `Supplier: ${supplierText}. `, groups.length > 1 ? "Each invoice gets its own import ID." : `Import ID ${groups[0].importId}.`),
@@ -2381,6 +2619,13 @@ async function addSelected() {
     input?.focus();
     toast("info", `Choose who supplied ${missing[0].name} first.`);
     return;
+  }
+
+  // A price that isn't a price would be added as $0.00 without a word: stop and show which line.
+  const badPrice = chosen.find((r) => snap.status.get(r.id) !== "exists" && r.price.trim() !== "" && parsePrice(r.price) === null);
+  if (badPrice) {
+    if (!state.drawer) openDrawer(badPrice.id);
+    return toast("bad", `“${badPrice.price}” isn't a price${badPrice.title.trim() ? ` (${badPrice.title.trim()})` : ""}. Enter it like 4.95, or clear it to add the product at $0.00.`);
   }
 
   // One import ID per invoice, made the first time its products are added.
@@ -2412,7 +2657,8 @@ async function addSelected() {
 
   const noBarcode = chosen.filter((r) => snap.status.get(r.id) === "missing").length;
   const withPhotos = chosen.filter((r) => rowPhotos(r).length).length;
-  if (!(await confirmAdd(toCreate.length, noBarcode, groups, withPhotos, stockInfo, toActivate.length))) return;
+  const priced = toCreate.filter((r) => parsePrice(r.price)).length;
+  if (!(await confirmAdd(toCreate.length, noBarcode, groups, withPhotos, stockInfo, toActivate.length, priced))) return;
   // Catalogue entries saved in short form (run reopened): fetch them in full first, for their descriptions.
   if (chosen.some((r) => r.catalogue?.slim)) {
     for (let i = 0; i < 100 && catBusy; i++) await new Promise((r) => setTimeout(r, 100));
@@ -2424,20 +2670,30 @@ async function addSelected() {
   closeDrawerSilently();
   const size = state.health?.maxCreateBatch ?? 15;
   state.creating = { done: 0, total: chosen.length };
-  const tally = { created: 0, skipped: 0, failed: 0, notOnPos: 0, photos: 0, photoErrors: 0, stockUnits: 0, stockProducts: 0, stockRepeat: 0, stockFailed: 0, activated: 0, activatedNotOnPos: 0, activateFailed: 0 };
+  const tally = { bundles: 0, bundleProblems: [], created: 0, skipped: 0, failed: 0, notOnPos: 0, photos: 0, photoErrors: 0, stockUnits: 0, stockProducts: 0, stockRepeat: 0, stockFailed: 0, activated: 0, activatedNotOnPos: 0, activateFailed: 0 };
   const invoiceRef = (src) => (src?.invoiceNumber ? `${(src.supplier ?? "").trim()}|${src.invoiceNumber}` : "");
   render();
 
-  for (let i = 0; i < toCreate.length; i += size) {
-    const batch = toCreate.slice(i, i + size);
+  // A line that also makes a helium bundle takes more of Shopify's allowance per request, so it counts for more.
+  const weight = (r) => (heliumFor(r).bundle ? (state.health?.bundleWeight ?? 2.5) : 1);
+  const batches = [];
+  for (const r of toCreate) {
+    const last = batches[batches.length - 1];
+    if (last && last.reduce((n, x) => n + weight(x), 0) + weight(r) <= size) last.push(r);
+    else batches.push([r]);
+  }
+  for (let bi = 0, i = 0; bi < batches.length; i += batches[bi].length, bi++) {
+    const batch = batches[bi];
     batch.forEach((r) => (r.adding = true));
     render();
     try {
       const res = await api.create(
         state.run.code,
-        batch.map(({ id, title, supplierCode, barcode, sourceId, photos, catalogue, useDescription }) => ({
+        batch.map(({ id, title, supplierCode, barcode, sourceId, photos, catalogue, useDescription, price, heliumSet, invoiceTitle }) => ({
+          ...((hl) => ({ foil: hl.foil, helium: hl.bundle ? hl.tier : null }))(heliumFor({ title, heliumSet, supplierCode, invoiceTitle, catalogue })),
           id,
           title,
+          price: parsePrice(price),
           supplierCode,
           barcode,
           qty: unitsFor({ id, qty: state.rows.find((x) => x.id === id)?.qty }) || null,
@@ -2455,7 +2711,9 @@ async function addSelected() {
         const r = byId.get(row.id);
         row.adding = false;
         if (r?.status === "created") {
-          row.result = { status: "created", productId: r.productId };
+          row.result = { status: "created", productId: r.productId, ...(r.bundle ? { bundle: r.bundle } : {}) };
+          if (r.bundle?.status === "created") tally.bundles++;
+          else if (r.bundle) tally.bundleProblems.push(r.bundle.error ?? r.bundle.reason ?? "");
           row.selected = false;
           tally.created++;
           if (r.stock > 0) {
@@ -2591,6 +2849,32 @@ async function addSelected() {
     toast("bad", `${plural(tally.photoErrors, "product was", "products were")} added without photos because Shopify refused them. Add the photos in Shopify, or try Fill in missing photos on the Catalogues page.`, { sticky: true });
   }
   showDone(tally, groups);
+  betterPhotosFor(toExisting);
+}
+
+/**
+ * Lines matched to products already in the store: a catalogue may have a sharper or newer photo for them. Swapped in
+ * on its own; the line says so, and new pictures can be reviewed (and put back) on the Catalogues page.
+ */
+async function betterPhotosFor(rows) {
+  const withCatalogue = rows.filter((r) => r.inStore?.productId && r.catalogue && !r.catalogue.mixed);
+  if (!withCatalogue.length) return;
+  const byId = new Map(withCatalogue.map((r) => [r.inStore.productId, r]));
+  try {
+    const t = await runPhotoCheck(api, { mode: "products", productIds: [...byId.keys()] });
+    for (const [pid, res] of t.byProduct) {
+      const row = byId.get(pid);
+      if (row) row.photoUpdate = res;
+    }
+    render();
+    saveDraft();
+    if (t.sharper || t.newer) {
+      toast(t.newer ? "info" : "ok", `Photos for products already in the store: ${checkSummary(t, plural)}`, t.newer ? { action: ["Review", () => (navigate("/catalogues"), setTimeout(() => catalogues.openPhotoReview(), 300))] } : {});
+    }
+  } catch (err) {
+    if (err instanceof SessionExpired) return sessionExpired();
+    console.warn("better photos", err);
+  }
 }
 
 /* =============================================================== undo an import */
@@ -2666,7 +2950,7 @@ async function undoImport(src) {
   toast(tally.failed || tally.stockFailed ? "bad" : "ok", parts.join(" "), { sticky: tally.priced + tally.other + tally.failed + tally.stockFailed > 0 });
 }
 
-function showDone({ created, skipped, failed, notOnPos, photos = 0, stockUnits = 0, stockProducts = 0, stockRepeat = 0, stockFailed = 0, activated = 0, activatedNotOnPos = 0, activateFailed = 0 }, groups = []) {
+function showDone({ bundles = 0, bundleProblems = [], created, skipped, failed, notOnPos, photos = 0, stockUnits = 0, stockProducts = 0, stockRepeat = 0, stockFailed = 0, activated = 0, activatedNotOnPos = 0, activateFailed = 0 }, groups = []) {
   const dlg = $("#done");
   const mark = $("#dn-mark");
   const partial = failed || notOnPos || stockFailed || activateFailed || activatedNotOnPos;
@@ -2685,7 +2969,10 @@ function showDone({ created, skipped, failed, notOnPos, photos = 0, stockUnits =
   if (stockProducts) bits.push(`${fmt(stockUnits)} ${stockUnits === 1 ? "unit" : "units"} of stock added across ${plural(stockProducts, "product")}.`);
   if (stockRepeat) bits.push(`${plural(stockRepeat, "product")} already had this invoice's stock added, so nothing was added twice.`);
   if (stockFailed) bits.push(`${plural(stockFailed, "product")} didn't get its stock: ${stockFailed === 1 ? "it's" : "they're"} marked in the list. Check the stock in Shopify before trying again.`);
-  if (created && notOnPos < created) bits.push("They're on Point of Sale now. Set their prices in the POS app.");
+  const unpriced = state.rows.filter((r) => r.result?.status === "created" && !parsePrice(r.price)).length;
+  if (created && notOnPos < created) bits.push(unpriced ? `They're on Point of Sale now. ${unpriced === created ? (created === 1 ? "It's" : "They're") : `${fmt(unpriced)} ${unpriced === 1 ? "is" : "are"}`} at $0.00 until you set ${unpriced === 1 ? "its price" : "prices"}.` : "They're on Point of Sale now, with their prices.");
+  if (bundles) bits.push(`${plural(bundles, "helium bundle")} added (balloon + inflation). ${unpriced ? "Bundles for balloons at $0.00 wait as drafts and go live, priced, when the balloon is priced." : "They're live with the balloon's price plus the inflation."}`);
+  if (bundleProblems.length) bits.push(`${plural(bundleProblems.length, "helium bundle")} ${bundleProblems.length === 1 ? "wasn't" : "weren't"} made: ${bundleProblems[0]}`);
   if (photos) bits.push(`${photos === created ? (created === 1 ? "It has" : "All have") : `${fmt(photos)} have`} photos from the catalogue.`);
   if (notOnPos) bits.push(`${plural(notOnPos, "was", "were")} created but couldn't be put on Point of Sale. In Shopify, open ${notOnPos === 1 ? "it" : "them"} and turn on the Point of Sale channel.`);
   if (skipped) bits.push(`${plural(skipped, "was", "were")} already in your store, so ${skipped === 1 ? "it was" : "they were"} skipped.`);
@@ -2706,6 +2993,7 @@ function showDone({ created, skipped, failed, notOnPos, photos = 0, stockUnits =
 
   const newBtn = $("#dn-new");
   const reviewBtn = $("#dn-review");
+  $("#dn-prices").hidden = !(created && unpriced);
   if (failed) {
     newBtn.textContent = "Review what's left";
     newBtn.value = "fix";
@@ -2732,6 +3020,8 @@ function showDone({ created, skipped, failed, notOnPos, photos = 0, stockUnits =
       } else if (v === "added") {
         state.filter = "added";
         render();
+      } else if (v === "prices") {
+        navigate(`/runs/${state.run.code}/prices`);
       }
     },
     { once: true },
@@ -2740,6 +3030,7 @@ function showDone({ created, skipped, failed, notOnPos, photos = 0, stockUnits =
 
 /* =============================================================== start up */
 
+const pricingPage = createPricing({ api, h, $, icon, toast, errorText, plural, state, SessionExpired, sessionExpired: () => sessionExpired() });
 const settingsPage = createSettings({ api, h, $, icon, toast, confirmDialog, fact, errorText, plural, state, SessionExpired, sessionExpired: () => sessionExpired() });
 
 const catalogues = createCatalogues({
@@ -2779,6 +3070,7 @@ async function checkHealth() {
     }
     else if (!hl.posChannel) toast("bad", "The Point of Sale channel wasn't found. New products would be created but not shown on POS.", { sticky: true, id: "pos" });
     if (state.view === "settings") settingsPage.refresh();
+    if (hl.shopify) loadHelium();
   } catch (err) {
     if (err instanceof SessionExpired) return sessionExpired();
     $("#conn").dataset.state = "bad";
@@ -2946,6 +3238,10 @@ function wire() {
   });
   $("#runs-mine").addEventListener("change", () => loadRuns({ reset: true }));
   $("#runs-more").addEventListener("click", () => loadRuns());
+  $("#run-check").addEventListener("click", async () => {
+    const n = await syncLive({ announce: true });
+    if (n === 0) toast("info", "Every product is still in Shopify. To remove an invoice, use Undo import to delete its products first.");
+  });
   $("#run-delete").addEventListener("click", deleteRun);
 
   addEventListener("beforeunload", (e) => {
@@ -2962,6 +3258,7 @@ function wire() {
   wireDrawer();
   catalogues.wire();
   settingsPage.wire();
+  pricingPage.wire();
 }
 
 wire();

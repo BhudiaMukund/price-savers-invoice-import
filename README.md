@@ -317,3 +317,66 @@ When the switch is on:
 
 The Shopify app needs `read_inventory`, `write_inventory` and `read_locations` (see the scopes above). If it
 doesn't have them, the site says so instead of failing quietly.
+
+
+## Prices
+
+Products are added at $0.00 unless a price is typed in the **Price** box on their line in the review screen (GST included). Anything left empty is priced later:
+
+- **Set prices** (a link in each run, and a button in the "added" dialog) opens `/runs/R2/prices`: every product the run added, with a price box. Enter moves down the list, and a column copied from a spreadsheet can be pasted into the first box. One Save sends every price to Shopify together.
+- **Prices** in the top bar (`/prices`) lists everything this tool added that is still at $0.00, from every run.
+
+Only the products in the import ledger can be priced here, only single-variant products, and only the price is changed: the pricing routes (`GET /api/pricing`, `POST /api/prices`, in `src/pricing.ts`) never send an inventory request, so saving prices can't change stock. Pricing writes nothing to the D1 database. Undo import still refuses to delete a product once it has a price.
+
+## Better photos from newer catalogues
+
+Products already in the store get a better photo when a catalogue has one (matched by barcode, or by supplier code for
+the same supplier). The two pictures are compared by their visual fingerprints:
+
+- **Same picture, clearly bigger** (at least 1.4 times the pixels): the sharper copy becomes the main photo and the old
+  copy is removed.
+- **A different picture, from a catalogue saved after the product's current photo**: it becomes the main photo and the
+  old one stays on the product as the second photo. It's listed under **Review new photos** on the Catalogues page,
+  with **Use new** (remove the old one), **Keep both** and **Put back** for each, or for all at once.
+- Anything else is left alone. Each product + catalogue photo pair is only looked at once.
+
+It runs on its own about 30 seconds after a catalogue is saved (for that catalogue's products), and after an invoice
+adds stock to products already in the store (those lines then say what changed). **Check all products** on the
+Catalogues page goes through the whole store, newest first. Photos with several colours in one picture are skipped.
+
+## Batch sizes
+
+Sized for the Workers Paid plan: 30 products per add, 50 per undo, 10 failed photos per retry, 2,500 store products per
+"Fill in missing photos" step. On the free plan, set `MAX_CREATE_BATCH` back to 15 and `MAX_UNDO_BATCH` to 20 in
+`src/limits.ts`.
+
+## Barcodes from catalogues
+
+When an invoice line has no barcode, but its supplier code matches an item in that supplier's catalogue that has one, the line takes the catalogue's barcode. The status column says "Barcode from the *supplier* catalogue". The line is then checked against the store, so a product that's already in Shopify shows as **In store** (and only gets stock) instead of being added twice. A barcode printed on the invoice is never replaced. If staff edit or clear the barcode, the catalogue doesn't fill it in again.
+
+## Foil balloons and helium bundles
+
+Lines that read as foil balloons (the title says foil, mylar, supershape or orbz and balloon, and not latex, air-fill or on a stick) are added as type **Foil Balloons**, as physical items that can be posted. While a balloon is at $0.00 it is on Point of Sale only. Once it has a price it goes on every sales channel.
+
+Foil balloons of 40cm or more also get a **helium bundle**, built like the store's existing ones. It's a separate product, "Helium INFLATED *name* Foil Balloon", of type Helium Inflated Balloons, on every channel, made of 1 × the balloon plus 1 × the matching size of the **Helium Inflation** product. The tool finds that product from an existing helium bundle, or by its name. It reads the size from the title ("45cm", "34in", "18\"") and the size each inflation variant covers from the variant's name ("40-50cm").
+
+- **On the review screen**, each foil balloon line has a "Helium bundle" tick box and a size. Untick it for an air-fill balloon filed as foil. Pick a size when the title doesn't give one.
+- **No second bundle.** Balloons already in the store are skipped as usual, and no bundle is made when a product with the bundle's name already exists.
+- **Price.** Shopify doesn't add up bundle prices, so the tool sets it to balloon + inflation. A balloon added at $0.00 gets its bundle as a $0.00 draft, so nothing can be bought online for the helium price alone. Pricing the balloon on the Prices page prices the bundle and makes it active.
+- **Update helium bundles** on the Prices page (under Helium bundles) reprices **every** helium bundle in the store,
+  including the ones made by the earlier one-off script: each is set to the sum of its parts (balloon + inflation). Press
+  it after changing a helium inflation price in Shopify, or after pricing balloons at the till. Bundles whose balloon is
+  still $0.00 are left alone, and products typed Helium Inflated Balloons that have no parts keep their price.
+- **Undo import** deletes the bundle first, then the balloon. A balloon whose bundle can't be deleted is kept.
+- A line with a bundle counts as 2.5 lines in a batch, because the bundle takes three more Shopify requests.
+
+## Products deleted by hand, and invoices that can't be removed
+
+An invoice can't leave a run while the import record says its products are in Shopify. That record used to be updated only by Undo import, so a product deleted by hand in Shopify admin kept the invoice (and the run) stuck. Now:
+
+- **Opening a run** compares its products with Shopify (`POST /api/runs/:code/check`, read-only on Shopify, one request per 100 products). Products that no longer exist stop counting. The same check runs when you try to remove an invoice, and from the **Check Shopify** link in the run bar.
+- **If the products really are in Shopify** (for example Undo kept them because they already had a price), removing the invoice offers **Remove, keep the products** (`POST /api/runs/:code/release`). They stay in Shopify, unlinked from the run; stock they received stays, and the same invoice still can't add it twice.
+
+## Photos Shopify couldn't process
+
+If a catalogue's photo page lists photos as failed (for example "Media could not be processed because the image is an unsupported file type"), press **Try the failed photos again**. The server downloads each photo itself, names it after its product (title and code, as the first upload does), reads its real type from the file's first bytes, and uploads it to Shopify Files with that type (this fixes links whose server sends the wrong or no Content-Type). Products that used the failed photo switch to the new one, and the failed copy is deleted from Shopify Files. Anything it can't fix gets its real reason in the list ("an AVIF image", "a web page, not a picture", "the supplier's server answered 404"). It does 8 photos per request, so it uses 4 outbound requests each and stays inside the Workers free plan.

@@ -32,6 +32,7 @@
     </nav>
     <div class="appbar-right">
       <a class="nav-link" href="/runs" data-nav id="nav-runs"><span data-icon="history"></span><span class="nav-link-text">Runs</span></a>
+      <a class="nav-link" href="/prices" data-nav id="nav-prices"><span data-icon="store"></span><span class="nav-link-text">Prices</span></a>
       <a class="nav-link" href="/catalogues" data-nav id="nav-catalogues"><span data-icon="image"></span><span class="nav-link-text">Catalogues</span></a>
       <span class="conn" id="conn" data-state="pending"><span class="conn-dot"></span><span class="conn-text">Connecting…</span></span>
       <div class="account">
@@ -170,6 +171,18 @@
               <button type="button" class="btn btn-secondary" id="cat-missing-find"><span class="btn-icon" data-icon="search"></span>Find products</button>
             </div>
           </section>
+          <section class="cat-card" aria-labelledby="cat-better-title">
+            <div class="cat-card-icon" data-icon="refresh"></div>
+            <div class="cat-card-body">
+              <h2 id="cat-better-title">Better photos</h2>
+              <p>Swaps in sharper copies, and newer photos from catalogues, for products that already have one. Runs after each catalogue and invoice.</p>
+              <div class="cat-better-actions">
+                <button type="button" class="btn btn-secondary" id="cat-better-run"><span class="btn-icon" data-icon="search"></span>Check all products</button>
+                <button type="button" class="btn btn-ghost" id="cat-better-review">See photo changes</button>
+              </div>
+              <p class="cat-better-note" id="cat-better-note" aria-live="polite"></p>
+            </div>
+          </section>
         </div>
 
         <!-- Upload wizard: shown after files are picked -->
@@ -177,6 +190,9 @@
 
         <!-- Missing photos results -->
         <section class="cat-missing" id="cat-missing" hidden></section>
+
+        <!-- New photos to look at -->
+        <section class="photo-review" id="photo-review" hidden aria-labelledby="photo-review-title"></section>
 
         <div class="recent-head cat-list-head">
           <h2>Uploads</h2>
@@ -192,6 +208,62 @@
     </section>
 
     <!-- Settings (from the profile menu) -->
+    <!-- Set prices: one run, or everything still at $0.00 -->
+    <section class="runs-page price-page" id="price-page" hidden aria-labelledby="price-title">
+      <div class="runs-inner price-inner">
+        <a class="link back-link" id="price-back" href="/runs" data-nav><span data-icon="left"></span><span class="back-text">All runs</span></a>
+        <header class="price-head">
+          <div class="price-head-text">
+            <h1 id="price-title">Set prices</h1>
+            <p class="runs-sub" id="price-sub"></p>
+          </div>
+          <div class="price-progress" id="price-progress" hidden>
+            <p class="price-summary" id="price-summary" aria-live="polite"></p>
+            <div class="price-meter" aria-hidden="true"><span id="price-meter-fill"></span></div>
+          </div>
+        </header>
+
+        <div class="price-toolbar">
+          <label class="price-search">
+            <span data-icon="search" aria-hidden="true"></span>
+            <input type="search" id="price-search" placeholder="Find by title, code or barcode" autocomplete="off" enterkeyhint="search" />
+          </label>
+          <div class="price-view" role="group" aria-label="How to show products">
+            <button type="button" class="price-view-btn" id="price-view-list" aria-pressed="true">List</button>
+            <button type="button" class="price-view-btn" id="price-view-quick" aria-pressed="false">One by one</button>
+          </div>
+          <label class="price-priced" id="price-priced-label"><input type="checkbox" class="check" id="price-show-priced" /> Show priced</label>
+        </div>
+
+        <div class="cat-banner is-bad" id="price-error" hidden></div>
+
+        <div id="price-list-view">
+          <p class="price-hint">Type a price and press Enter for the next product. It saves as you go. To fill many at once, paste a column of prices from a spreadsheet into the first box.</p>
+          <ul class="price-list" id="price-list"></ul>
+        </div>
+
+        <div class="price-quick" id="price-quick" hidden></div>
+
+        <div class="list-empty" id="price-empty" hidden></div>
+
+        <details class="balloon-sync">
+          <summary>Helium bundles</summary>
+          <div class="balloon-sync-body">
+            <button type="button" class="btn btn-sm btn-secondary" id="balloon-sync">Update helium bundles</button>
+            <span class="balloon-sync-note" id="balloon-sync-note" aria-live="polite">Press after changing a helium inflation price, or pricing balloons at the till. Every helium bundle in the store (old ones too) is set to balloon + inflation.</span>
+          </div>
+        </details>
+
+        <div class="price-status" id="price-status" role="status" aria-live="polite" hidden></div>
+      </div>
+    </section>
+
+    <dialog class="price-zoom" id="price-zoom" aria-label="Product photo">
+      <form method="dialog"><button class="price-zoom-close" aria-label="Close photo"><span data-icon="x"></span></button></form>
+      <img id="price-zoom-img" alt="" />
+      <p id="price-zoom-title"></p>
+    </dialog>
+
     <section class="runs-page" id="settings-page" hidden aria-labelledby="set-title">
       <div class="runs-inner set-inner">
         <div class="runs-head">
@@ -249,8 +321,16 @@
         </div>
         <div class="cu-stats" id="cu-stats"></div>
         <div class="cat-banner" id="cu-banner" hidden></div>
+        <div class="cu-retry" id="cu-check-row" hidden>
+          <button type="button" class="btn btn-sm btn-secondary" id="cu-check">Check these photos with Shopify</button>
+          <span class="cu-retry-note" id="cu-check-note" aria-live="polite">Asks Shopify what happened to each photo that still says processing. Any it never saved can then be sent again.</span>
+        </div>
         <details class="cu-failed" id="cu-failed" hidden>
           <summary id="cu-failed-sum"></summary>
+          <div class="cu-retry">
+            <button type="button" class="btn btn-sm btn-secondary" id="cu-retry">Try the failed photos again</button>
+            <span class="cu-retry-note" id="cu-retry-note" aria-live="polite">Downloads each photo here and sends it to Shopify with its real file type, and tells you the reason for any it can't fix.</span>
+          </div>
           <ul id="cu-failed-list"></ul>
         </details>
         <div class="runs-tools">
@@ -290,6 +370,8 @@
         <div class="run-bar" id="run-bar">
           <p class="run-line" id="run-line"></p>
           <span class="save-state" id="save-state" data-state="saved"></span>
+          <a class="link run-prices" id="run-prices" href="#" data-nav hidden>Set prices</a>
+          <button type="button" class="link run-check" id="run-check" hidden title="Products deleted by hand in Shopify stop counting">Check Shopify</button>
           <button type="button" class="link run-delete" id="run-delete" hidden>Delete run</button>
         </div>
         <div class="review-head">
@@ -447,6 +529,7 @@
       <div class="done-ids" id="dn-ids"></div>
       <div class="modal-actions modal-actions-stack">
         <button value="new" class="btn btn-brand" id="dn-new">Import another invoice</button>
+        <button value="prices" class="btn btn-secondary" id="dn-prices" hidden>Set prices</button>
         <button value="review" class="btn btn-secondary" id="dn-review"></button>
       </div>
     </form>

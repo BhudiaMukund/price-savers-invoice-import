@@ -2,7 +2,7 @@
 // created by choosing the clearly marked "Add new supplier" option, and never when the name is just a
 // different spelling of one that exists ("ALPEN PTY LTD" is Alpen). The browser's own autofill is off.
 
-import { supplierKey } from "./suppliers.js";
+import { supplierKey, supplierSquash } from "./suppliers.js";
 
 /** The existing supplier this name refers to: same name ignoring case/spacing, or the same name once
  *  "Pty Ltd", "Australia" and the like are ignored. */
@@ -12,7 +12,8 @@ export function sameSupplier(name, list) {
   const exact = list.find((s) => s.toLowerCase() === n);
   if (exact) return exact;
   const k = supplierKey(name);
-  return k ? (list.find((s) => supplierKey(s) === k) ?? null) : null;
+  if (!k) return null;
+  return list.find((s) => supplierKey(s) === k) ?? list.find((s) => supplierSquash(s) === supplierSquash(name)) ?? null;
 }
 
 /** Suppliers matching what's typed: names starting with it first, then names containing it. */

@@ -14,11 +14,16 @@ export function supplierKey(name) {
     .trim();
 }
 
+/** Like supplierKey but with the spaces gone too, so "PJ SAS" and "PJSAS" are the same supplier. */
+export function supplierSquash(name) {
+  return supplierKey(name).replace(/ /g, "");
+}
+
 /** The existing supplier that a name read off an invoice refers to, or null if there's no clear match. */
 export function matchSupplier(name, list) {
   const k = supplierKey(name);
   if (!k) return null;
-  const exact = list.find((s) => supplierKey(s) === k);
+  const exact = list.find((s) => supplierKey(s) === k) ?? list.find((s) => supplierSquash(s) === supplierSquash(name));
   if (exact) return exact;
   // One name containing the other ("IG Design" vs "IG Design Group Australia"), if it's unambiguous.
   const close = list.filter((s) => {

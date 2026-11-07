@@ -57,3 +57,15 @@ describe("supplier picker", () => {
     expect(filterSuppliers("design", list)).toEqual(["IG-Design"]);
   });
 });
+
+// @ts-expect-error plain JS module served to the browser
+import { matchSupplier as _ms, supplierSquash } from "../public/js/suppliers.js";
+// @ts-expect-error plain JS module served to the browser
+import { sameSupplier as _same } from "../public/js/supplier-picker.js";
+describe("spacing differences", () => {
+  it("treats PJ SAS and PJSAS as one supplier", () => {
+    expect(supplierSquash("PJ SAS")).toBe("pjsas");
+    expect(_ms("PJ SAS", ["Lylac Homeware", "PJSAS"])).toBe("PJSAS");
+    expect(_same("PJSAS", ["PJ SAS"])).toBe("PJ SAS");
+  });
+});
