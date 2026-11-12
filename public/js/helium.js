@@ -3,7 +3,8 @@
  * check and name it), so both read a title the same way.
  *
  * A bundle is a separate product, "Helium INFLATED <name> Foil Balloon", made of the flat balloon plus the
- * Helium Inflation size that fits it. Its stock comes from the balloon; its price is balloon + inflation.
+ * Helium Inflation size that fits it. Its stock comes from the balloon; its price is
+ * balloon + inflation. It is never posted: helium balloons are collected from the shop.
  */
 
 /** Smallest balloon that gets a helium bundle. Smaller foil balloons are air-filled. */
@@ -79,6 +80,37 @@ export function pickTier(sizeCm, tiers) {
 }
 
 /**
+ * A foil balloon title without supplier pack wording. Foil balloons are sold one at a time, so "(Pack of 5)",
+ * "5pk", "5 Pack" or a trailing "x 5" is how the wholesaler sells them, not what the product is.
+ * 'Decrotex Star Gold Balloon 18" (Pack of 5)' → 'Decrotex Star Gold Balloon 18"'. Sizes such as "50x50cm" stay.
+ */
+export function withoutPack(title) {
+  return String(title ?? "")
+    .replace(/\s*[([]\s*(?:pack|set|bag|box)\s+of\s+\d{1,3}\s*[)\]]/gi, "")
+    .replace(/\s*\b(?:pack|set|bag|box)\s+of\s+\d{1,3}\b/gi, "")
+    .replace(/\s*\(?\b\d{1,3}\s*-?\s*(?:pk|pack|pcs?|pce|pieces?)\b\)?/gi, "")
+    .replace(/\s+x\s*\d{1,3}\s*$/i, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+/**
+ * A single-digit number balloon, read the way the storefront's age finder reads it: "<Finish> Number #2" or a
+ * supershape "<Colour> <Design> Balloon #6". The digit, or null. "#21" (an age on a round balloon) is not one.
+ */
+export function numberDigit(title) {
+  const t = String(title ?? "");
+  const m = /\bNumber\s*#?\s*(\d)(?!\d)/i.exec(t) ?? /\bBalloon\s*#\s*(\d)(?!\d)/i.exec(t);
+  return m ? Number(m[1]) : null;
+}
+
+/** Tag on helium bundles for number balloons; the store's "Helium Inflated Numbers" collection is built from it. */
+export const NUMBER_TAG = "helium-number";
+
+/** Shipping weight for one flat foil balloon in its packet, in kg. */
+export const FOIL_WEIGHT_KG = 0.05;
+
+/**
  * What the review screen suggests for a line: whether it's a foil balloon (these go to every sales channel once
  * priced), its size, and the inflation to bundle it with. `bundle` is on only for foil balloons of 40cm or more
  * whose size fits an inflation; staff can switch it off (an air-fill balloon filed as foil) or pick a size.
@@ -89,6 +121,16 @@ export function heliumSuggestion(title, tiers, more = {}) {
   const size = sizeOf([title, more.invoiceTitle, more.catalogueTitle]);
   const tier = pickTier(size, tiers);
   return { foil: true, size, tier: tier?.variantId ?? null, bundle: !!tier };
+}
+
+/**
+ * An air-fill balloon: a foil balloon with no helium bundle because staff unticked it, or because it's under 40cm.
+ * Filed in Shopify as "Air Foil Balloon" (not "Foil Balloons"), so the store doesn't offer it inflated.
+ * `hl`: what heliumFor / heliumSuggestion returned. `unticked`: staff switched the bundle off.
+ */
+export function isAirFill(hl, unticked) {
+  if (!hl?.foil || hl.bundle) return false;
+  return !!unticked || (hl.size != null && hl.size < MIN_HELIUM_CM);
 }
 
 /** "Foil Balloon Luxe Gold Number #3" → "Helium INFLATED Luxe Gold Number #3 Foil Balloon", the store's own pattern. */
@@ -102,8 +144,12 @@ export function bundleTitle(title) {
   return `Helium INFLATED ${name || "Foil"} Foil Balloon`.slice(0, 255);
 }
 
-/** Bundle price: balloon + inflation, both GST-inclusive. "8.00" + "12.00" → "20.00". */
-export function bundlePrice(balloon, inflation) {
-  const cents = Math.round(Number(balloon) * 100) + Math.round(Number(inflation) * 100);
+/**
+ * Bundle price: balloon + inflation × the times the bundle is filled (1 for every bundle this tool makes), all
+ * GST-inclusive. "8.00" + "12.00" → "20.00".
+ */
+export function bundlePrice(balloon, inflation, count = 1) {
+  const n = Math.max(1, Math.floor(Number(count) || 1));
+  const cents = Math.round(Number(balloon) * 100) + Math.round(Number(inflation) * 100) * n;
   return (cents / 100).toFixed(2);
 }

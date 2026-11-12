@@ -11,7 +11,7 @@ import { createReader, MAX_ROWS_PER_RUN, titleKey } from "./invoice-reader.js";
 import { topText } from "./sheet-read.js";
 import { detectSupplier } from "./supplier-detect.js";
 import { resolveQuantity } from "./quantity.js";
-import { heliumSuggestion } from "./helium.js";
+import { heliumSuggestion, isAirFill } from "./helium.js";
 import { checkSummary, runPhotoCheck } from "./photo-updates.js";
 
 /* =============================================================== state */
@@ -920,7 +920,13 @@ function heliumControl(row, status) {
   };
   box.addEventListener("change", () => save(box.checked, pick.value || hl.tier));
   pick.addEventListener("change", () => save(!!pick.value, pick.value));
-  const why = hl.bundle ? "Also adds “Helium INFLATED … Foil Balloon”: balloon + inflation. Untick for air-fill balloons." : hl.size && hl.size < 40 ? `About ${hl.size}cm: too small for helium.` : "Tick and choose a size to add a helium bundle.";
+  const why = hl.bundle
+    ? `Also adds “Helium INFLATED … Foil Balloon”: balloon + inflation. Untick for air-fill balloons (added as Air Foil Balloon).`
+    : hl.size && hl.size < 40
+      ? `About ${hl.size}cm: too small for helium. Added as Air Foil Balloon.`
+      : row.heliumSet && !row.heliumSet.on
+        ? "No bundle: added as Air Foil Balloon. Tick to make a helium bundle."
+        : "Tick and choose a size to add a helium bundle.";
   return h("label", { class: `qty-wrap helium-wrap${hl.bundle ? " is-on" : ""}`, title: why }, box, "Helium bundle", pick);
 }
 
@@ -2690,7 +2696,7 @@ async function addSelected() {
       const res = await api.create(
         state.run.code,
         batch.map(({ id, title, supplierCode, barcode, sourceId, photos, catalogue, useDescription, price, heliumSet, invoiceTitle }) => ({
-          ...((hl) => ({ foil: hl.foil, helium: hl.bundle ? hl.tier : null }))(heliumFor({ title, heliumSet, supplierCode, invoiceTitle, catalogue })),
+          ...((hl) => ({ foil: hl.foil, helium: hl.bundle ? hl.tier : null, air: isAirFill(hl, !!heliumSet && !heliumSet.on) }))(heliumFor({ title, heliumSet, supplierCode, invoiceTitle, catalogue })),
           id,
           title,
           price: parsePrice(price),

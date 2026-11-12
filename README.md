@@ -356,9 +356,13 @@ When an invoice line has no barcode, but its supplier code matches an item in th
 
 ## Foil balloons and helium bundles
 
-Lines that read as foil balloons (the title says foil, mylar, supershape or orbz and balloon, and not latex, air-fill or on a stick) are added as type **Foil Balloons**, as physical items that can be posted. While a balloon is at $0.00 it is on Point of Sale only. Once it has a price it goes on every sales channel.
+Lines that read as foil balloons (the title says foil, mylar, supershape or orbz and balloon, and not latex, air-fill or on a stick) are added as type **Foil Balloons**, as physical items that can be posted, with a shipping weight of 50 g so postage is quoted properly. While a balloon is at $0.00 it is on Point of Sale only. Once it has a price it goes on every sales channel.
 
-Foil balloons of 40cm or more also get a **helium bundle**, built like the store's existing ones. It's a separate product, "Helium INFLATED *name* Foil Balloon", of type Helium Inflated Balloons, on every channel, made of 1 × the balloon plus 1 × the matching size of the **Helium Inflation** product. The tool finds that product from an existing helium bundle, or by its name. It reads the size from the title ("45cm", "34in", "18\"") and the size each inflation variant covers from the variant's name ("40-50cm").
+Foil balloons are sold one at a time, even when the wholesaler sells them in packs, so supplier pack wording ("(Pack of 5)", "5pk", a trailing "x 5") is taken out of foil balloon titles when they're added, and the AI title tidy is told never to add it.
+
+A foil balloon with no helium bundle because staff unticked it, or because it's under 40cm, is added as type **Air Foil Balloon** instead, so the storefront doesn't offer it inflated. One whose size couldn't be read stays Foil Balloons.
+
+Foil balloons of 40cm or more also get a **helium bundle**, built like the store's existing ones. It's a separate product, "Helium INFLATED *name* Foil Balloon", of type Helium Inflated Balloons, on every channel, made of 1 × the balloon plus 1 × the matching size of the **Helium Inflation** product. Supplier pack wording in a title ("Pack of 5") is how the wholesaler sells them, not what one product holds, so it never changes the bundle. Bundles are **collect in store only** (not a shippable item), because an inflated balloon can't be posted. Bundles for number balloons ("Gold Number #2", "Mint Hat & Smile Balloon #1") get the tag `helium-number`, which the store's Helium Inflated Numbers collection is built from. The tool finds that product from an existing helium bundle, or by its name. It reads the size from the title ("45cm", "34in", "18\"") and the size each inflation variant covers from the variant's name ("40-50cm").
 
 - **On the review screen**, each foil balloon line has a "Helium bundle" tick box and a size. Untick it for an air-fill balloon filed as foil. Pick a size when the title doesn't give one.
 - **No second bundle.** Balloons already in the store are skipped as usual, and no bundle is made when a product with the bundle's name already exists.
@@ -366,7 +370,11 @@ Foil balloons of 40cm or more also get a **helium bundle**, built like the store
 - **Update helium bundles** on the Prices page (under Helium bundles) reprices **every** helium bundle in the store,
   including the ones made by the earlier one-off script: each is set to the sum of its parts (balloon + inflation). Press
   it after changing a helium inflation price in Shopify, or after pricing balloons at the till. Bundles whose balloon is
-  still $0.00 are left alone, and products typed Helium Inflated Balloons that have no parts keep their price.
+  still $0.00 are left alone, and products typed Helium Inflated Balloons that have no parts keep their price. Any bundle
+  set up as a posted item is changed to collect in store only.
+
+**Keep number balloon titles in the store's pattern** ("<Finish> Number #2", or "<Colour> <Design> Balloon #6" for
+supershape sets). The storefront's age finder builds ages from those titles.
 - **Undo import** deletes the bundle first, then the balloon. A balloon whose bundle can't be deleted is kept.
 - A line with a bundle counts as 2.5 lines in a batch, because the bundle takes three more Shopify requests.
 

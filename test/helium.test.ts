@@ -5,7 +5,7 @@ import type { Env } from "../src/types";
 import { RunStore, resetSchemaCache } from "../src/store";
 import { sqliteDb } from "./sqlite-db";
 // @ts-expect-error plain JS module shared with the browser
-import { balloonSize, bundlePrice, bundleTitle, heliumSuggestion, isFoilBalloon, pickTier, tierRange } from "../public/js/helium.js";
+import { balloonSize, bundlePrice, bundleTitle, heliumSuggestion, isAirFill, isFoilBalloon, numberDigit, pickTier, tierRange, withoutPack } from "../public/js/helium.js";
 
 const T = (variantId: string, title: string, price: string) => {
   const r = tierRange(title);
@@ -75,6 +75,32 @@ describe("reading a balloon title", () => {
     expect(bundlePrice("8.00", "12.00")).toBe("20.00");
     expect(bundlePrice("0.1", "0.2")).toBe("0.30");
   });
+
+  it("takes the wholesaler's pack wording out of a foil balloon title, but not sizes", () => {
+    expect(withoutPack('Decrotex Star Gold Balloon 18" (Pack of 5)')).toBe('Decrotex Star Gold Balloon 18"');
+    expect(withoutPack("Boy Confetti Reveal Balloon 60cm (Pack of 5)")).toBe("Boy Confetti Reveal Balloon 60cm");
+    expect(withoutPack("18 Inch Decrotex Foil Star Silver x 5")).toBe("18 Inch Decrotex Foil Star Silver");
+    expect(withoutPack("Foil Balloon 5pcs Hearts 45cm")).toBe("Foil Balloon Hearts 45cm");
+    expect(withoutPack("Butterfly Foil Helium Balloon 50x50cm")).toBe("Butterfly Foil Helium Balloon 50x50cm");
+    expect(withoutPack("Foil Balloon Gold Number #5")).toBe("Foil Balloon Gold Number #5");
+  });
+
+  it("reads number balloons the way the storefront's age finder does", () => {
+    expect(numberDigit("Foil Balloon Gold Number #0")).toBe(0);
+    expect(numberDigit("Gold Number 5 Foil Balloon 86cm")).toBe(5);
+    expect(numberDigit("Mint Hat & Smile Balloon #1 86cm")).toBe(1);
+    expect(numberDigit("Foil Balloon Pink Holographic Happy #21 Birthday - Round")).toBeNull();
+    expect(numberDigit("Sparkling Fizz Black & Gold #18 - Round")).toBeNull();
+    expect(numberDigit("Cocktail Glass Balloon 126cm")).toBeNull();
+  });
+
+  it("files a foil balloon as air-fill when staff untick its bundle or it's under 40cm", () => {
+    expect(isAirFill(heliumSuggestion("Mini Heart Foil Balloon 23cm", TIERS), false)).toBe(true);
+    expect(isAirFill({ ...heliumSuggestion("Gold Star Foil Balloon 45cm", TIERS), bundle: false }, true)).toBe(true);
+    expect(isAirFill(heliumSuggestion("Gold Star Foil Balloon 45cm", TIERS), false)).toBe(false); // has a bundle
+    expect(isAirFill(heliumSuggestion("Foil Balloon Luxe Gold Number #3", TIERS), false)).toBe(false); // size unknown: left as foil
+    expect(isAirFill(heliumSuggestion("Paper Plates 23cm", TIERS), true)).toBe(false); // not a balloon
+  });
 });
 
 /* ------------------------------------------------------------------ the whole flow against a pretend Shopify */
@@ -89,7 +115,7 @@ const env = {
   DEV_AUTH_BYPASS: "true",
 } as unknown as Env;
 
-type P = { id: string; input: any; variantId: string; price: string; status: string; channels: string[]; metafield: string };
+type P = { id: string; input: any; variantId: string; price: string; status: string; channels: string[]; metafield: string; parts?: { id: string; quantity: number }[] };
 let shop: Map<string, P>;
 let links: any[];
 let deleted: string[];
@@ -132,6 +158,7 @@ beforeEach(async () => {
       if (query.includes("query Titles")) return Response.json({ data: { products: { nodes: existingTitles.map((title) => ({ title })) } } });
       if (query.includes("productVariantRelationshipBulkUpdate")) {
         links.push(variables.input[0]);
+        for (const p of shop.values()) if (p.variantId === variables.input[0].parentProductVariantId) p.parts = variables.input[0].productVariantRelationshipsToCreate;
         return Response.json({ data: { productVariantRelationshipBulkUpdate: { parentProductVariants: [{ id: variables.input[0].parentProductVariantId }], userErrors: [] } } });
       }
       if (query.startsWith("mutation {")) {
@@ -168,7 +195,10 @@ beforeEach(async () => {
           data: {
             nodes: variables.ids.map((id: string) => {
               const p = shop.get(id);
-              if (p) return { __typename: "Product", id, status: p.status, variants: { nodes: [{ id: p.variantId, price: p.price }] } };
+              if (p) {
+                const components = { nodes: (p.parts ?? []).map((c) => ({ quantity: c.quantity, productVariant: { id: c.id } })) };
+                return { __typename: "Product", id, status: p.status, variants: { nodes: [{ id: p.variantId, price: p.price, productVariantComponents: components }] } };
+              }
               const v = inflation.variants.nodes.find((x) => x.id === id);
               return v ? { __typename: "ProductVariant", id, price: v.price } : null;
             }),
@@ -214,9 +244,13 @@ describe("helium bundles for new foil balloons", () => {
     const [base, bundle] = [...shop.values()];
     expect(base!.input).toMatchObject({ productType: "Foil Balloons", status: "ACTIVE" });
     expect(base!.input.variants[0].inventoryItem.requiresShipping).toBe(true);
+    expect(base!.input.variants[0].inventoryItem.measurement).toEqual({ weight: { value: 0.05, unit: "KILOGRAMS" } }); // so postage is quoted
     expect(base!.channels).toEqual(["P2"]); // not online at $0
     expect(bundle!.input).toMatchObject({ title: "Helium INFLATED Gold Star 45cm Foil Balloon", productType: "Helium Inflated Balloons", status: "DRAFT" });
     expect(bundle!.input.variants[0]).toMatchObject({ price: "0.00", requiresComponents: true });
+    expect(bundle!.input.variants[0].inventoryItem.requiresShipping).toBe(false); // collected in store, never posted
+    expect(bundle!.input.variants[0].inventoryItem.measurement).toBeUndefined();
+    expect(bundle!.input.tags).not.toContain("helium-number");
     expect(bundle!.channels).toEqual(["P1", "P2", "P3"]);
     expect(bundle!.metafield).toBe(IMPORT); // so Undo can remove it
     expect(links[0]).toEqual({
@@ -278,6 +312,37 @@ describe("helium bundles for new foil balloons", () => {
     expect(deleted).toEqual([bundle!.id, base!.id]);
   });
 
+  it("adds a foil balloon the wholesaler packs in 5s as one balloon with one fill", async () => {
+    await post("/api/create", { runCode: "R1", items: [balloon({ title: 'Decrotex Star Gold Balloon 18" (Pack of 5)', price: "8.00" })] });
+    const [base, bundle] = [...shop.values()];
+    expect(base!.input.title).toBe('Decrotex Star Gold Balloon 18"');
+    expect(bundle!.input.title).toBe('Helium INFLATED Decrotex Star Gold Balloon 18" Foil Balloon');
+    expect(links[0].productVariantRelationshipsToCreate).toEqual([
+      { id: base!.variantId, quantity: 1 },
+      { id: "gid://shopify/ProductVariant/940", quantity: 1 },
+    ]);
+    expect(bundle!.input.variants[0].price).toBe("14.00");
+    expect(base!.input.variants[0].inventoryItem.measurement.weight.value).toBe(0.05);
+  });
+
+  it("tags number balloon bundles for the Numbers collection", async () => {
+    await post("/api/create", { runCode: "R1", items: [balloon({ title: "Mint Hat & Smile Balloon #1 86cm", helium: "gid://shopify/ProductVariant/980" })] });
+    const [, bundle] = [...shop.values()];
+    expect(bundle!.input.tags).toEqual(expect.arrayContaining(["helium-number", `import-${IMPORT}`, "run-R1"]));
+  });
+
+  it("files an unticked foil balloon as Air Foil Balloon, but never one that has a bundle", async () => {
+    await post("/api/create", {
+      runCode: "R1",
+      items: [balloon({ title: "Silver Letter A Foil Balloon 40cm", helium: null, air: true }), balloon({ id: "b", title: "Gold Moon Foil Balloon 45cm", air: true })],
+    });
+    const [air, foil, bundle] = [...shop.values()];
+    expect(air!.input.productType).toBe("Air Foil Balloon");
+    expect(air!.input.variants[0].inventoryItem.requiresShipping).toBe(true); // flat air-fill balloons can be posted
+    expect(foil!.input.productType).toBe("Foil Balloons"); // it got a bundle, so it's a helium balloon
+    expect(bundle!.input.productType).toBe("Helium Inflated Balloons");
+  });
+
   it("refuses a batch with too many bundles for one request", async () => {
     const items = Array.from({ length: 13 }, (_, i) => balloon({ id: `r${i}`, title: `Star ${i} Foil Balloon 45cm` }));
     const res = await app.fetch(new Request("http://x/api/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ runCode: "R1", items }) }), env);
@@ -335,7 +400,7 @@ describe("repricing every helium bundle in the store", () => {
                 pageInfo: { hasNextPage: false, endCursor: null },
                 nodes: [
                   { id: "gid://shopify/Product/1", variants: { nodes: [v("gid://shopify/ProductVariant/1", "20.00", [["8.00", 1], ["15.00", 1]])] } }, // inflation went 12 -> 15
-                  { id: "gid://shopify/Product/2", variants: { nodes: [v("gid://shopify/ProductVariant/2", "14.00", [["8.00", 1], ["6.00", 1]])] } }, // already right
+                  { id: "gid://shopify/Product/2", variants: { nodes: [{ ...v("gid://shopify/ProductVariant/2", "14.00", [["8.00", 1], ["6.00", 1]]), inventoryItem: { requiresShipping: true } }] } }, // right price, but set up as posted
                   { id: "gid://shopify/Product/3", variants: { nodes: [v("gid://shopify/ProductVariant/3", "0.00", [["0.00", 1], ["6.00", 1]])] } }, // balloon unpriced
                   { id: "gid://shopify/Product/4", variants: { nodes: [v("gid://shopify/ProductVariant/4", "20.00", [])] } }, // not a real bundle
                 ],
@@ -345,13 +410,49 @@ describe("repricing every helium bundle in the store", () => {
         }
         if (query.startsWith("mutation {")) {
           for (const m of query.matchAll(/productVariantsBulkUpdate\(productId: "([^"]+)", variants: \[\{id: "[^"]+", price: "([^"]+)"\}\]\)/g)) updates.push(`${m[1]}=${m[2]}`);
+          for (const m of query.matchAll(/productVariantsBulkUpdate\(productId: "([^"]+)", variants: \[\{id: "[^"]+", inventoryItem: \{requiresShipping: false\}\}\]\)/g)) updates.push(`${m[1]}=collect only`);
           return Response.json({ data: { m0: { userErrors: [] } } });
         }
         return Response.json({ errors: [{ message: "unmocked" }] });
       }),
     );
     const res = await post("/api/bundles/reprice", {});
-    expect(res).toMatchObject({ checked: 4, repriced: 1, waiting: 1, noParts: 1, next: null });
-    expect(updates).toEqual(["gid://shopify/Product/1=23.00"]);
+    expect(res).toMatchObject({ checked: 4, repriced: 1, waiting: 1, noParts: 1, unshippable: 1, next: null });
+    expect(updates).toEqual(["gid://shopify/Product/1=23.00", "gid://shopify/Product/2=collect only"]);
+  });
+});
+
+
+describe("pack wording on bundles already in the store", () => {
+  it("never changes a bundle's parts because its title says Pack of 5", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_u: string, init: any) => {
+        const { query } = JSON.parse(init.body);
+        if (query.includes("query Bundles")) {
+          const part = (id: string, price: string, title: string, productType: string) => ({ quantity: 1, productVariant: { id, price, product: { title, productType } } });
+          return Response.json({
+            data: {
+              products: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    id: "gid://shopify/Product/10",
+                    title: 'Helium INFLATED Decrotex Star Gold Balloon 18" (Pack of 5) Foil Balloon',
+                    variants: { nodes: [{ id: "gid://shopify/ProductVariant/10", price: "13.00", inventoryItem: { requiresShipping: false }, productVariantComponents: { nodes: [part("gid://shopify/ProductVariant/11", "8.00", 'Decrotex Star Gold Balloon 18" (Pack of 5)', "Foil Balloons"), part("gid://shopify/ProductVariant/12", "5.00", "40-50cm - Helium Inflation", "Service")] } }] },
+                  },
+                ],
+              },
+            },
+          });
+        }
+        if (query.startsWith("mutation {")) calls.push(query);
+        return Response.json({ data: { m0: { userErrors: [] } } });
+      }),
+    );
+    const res = await post("/api/bundles/reprice", {});
+    expect(res).toMatchObject({ checked: 1, repriced: 0, errors: [] });
+    expect(calls).toEqual([]); // $8 + $5 = $13 already: nothing to do
   });
 });

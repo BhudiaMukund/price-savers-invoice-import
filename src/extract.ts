@@ -53,6 +53,8 @@ export const TITLE_STYLE = `House style for product titles (Price Savers SA, a p
   Examples: "Gold Happy Birthday Foil Banner 2.5m", "Assorted Latex Balloons 30cm (Pack of 25)",
   "Pastel Pink Paper Plates 23cm (Pack of 10)", "Kangaroo Souvenir Keyring".
 - Write pack sizes as "(Pack of N)". Leave it out for single items.
+- Foil balloons (including supershapes, numbers, letters and orbz) are sold one at a time, even when the
+  wholesaler sells them in packs: never put a pack size or count ("Pack of 5", "5pk", "x 5") in a foil balloon title.
 - Units in lower case with no space: 30cm, 2.5m, 500ml.
 - Spell out supplier abbreviations: BLN or BALL = Balloon, LTX = Latex, ASST = Assorted, PK or PCK = Pack,
   NAPK = Napkins, PLT = Plates, BNR = Banner, HB = Happy Birthday, MET = Metallic, HOLO = Holographic.

@@ -34,9 +34,9 @@ import { CatalogueStore, FILE_ID_RE } from "./catalogue";
 import { filesAccess } from "./files";
 import { MAX_PRICE_BATCH, fetchPrices, normalisePrice, setPrices } from "./pricing";
 import { canManage, readSettings, writeSettings, admins } from "./settings";
-import { BALLOON_TYPE, BUNDLE_TYPE, dropBundle, findInflation, linkBundle, repriceStoreBundles, syncBalloons, titlesInStore, type Inflation } from "./helium";
+import { AIR_TYPE, BALLOON_TYPE, BUNDLE_TYPE, dropBundle, findInflation, linkBundle, repriceStoreBundles, syncBalloons, titlesInStore, type Inflation } from "./helium";
 // @ts-expect-error plain JS module shared with the browser
-import { bundlePrice, bundleTitle } from "../public/js/helium.js";
+import { bundlePrice, bundleTitle, FOIL_WEIGHT_KG, NUMBER_TAG, numberDigit, withoutPack } from "../public/js/helium.js";
 import { BUNDLE_WEIGHT } from "./limits";
 import { supplierMatchKey } from "./catalogue";
 
@@ -74,6 +74,8 @@ type ClientItem = ExtractedItem & {
   foil?: boolean;
   /** Make a helium bundle with this size of the Helium Inflation product (its variant ID). */
   helium?: string | null;
+  /** A foil balloon filled with air (staff unticked the bundle, or it's under 40cm): typed "Air Foil Balloon". */
+  air?: boolean;
 };
 
 /** What makes "this invoice adds stock to this product" the same thing twice. */
@@ -101,9 +103,11 @@ function readItems(body: unknown, max: number): ClientItem[] | null {
   const str = (v: unknown, n: number) => (typeof v === "string" ? v.trim().slice(0, n) : typeof v === "number" ? String(v) : "");
   return items.map((raw) => {
     const r = (raw ?? {}) as Record<string, unknown>;
+    const title = str(r.title, 255).replace(/\s+/g, " ");
     return {
       id: str(r.id, 64) || undefined,
-      title: str(r.title, 255).replace(/\s+/g, " "),
+      // Foil balloons are sold singly: supplier pack wording ("Pack of 5") never goes in their title.
+      title: r.foil === true ? withoutPack(title) || title : title,
       supplierCode: str(r.supplierCode, 64) || null,
       barcode: str(r.barcode, 64) || null,
       vendor: str(r.vendor, 100).replace(/\s+/g, " ") || null,
@@ -116,6 +120,7 @@ function readItems(body: unknown, max: number): ClientItem[] | null {
       price: normalisePrice(r.price),
       foil: r.foil === true,
       helium: typeof r.helium === "string" && VARIANT_ID_RE.test(r.helium) ? r.helium : null,
+      air: r.air === true,
     };
   });
 }
@@ -360,6 +365,8 @@ app.post("/api/create", async (c) => {
     const barcode = analyzeBarcode(row.barcode).digits;
     const src = items.find((i) => i.id === row.id) ?? items[rows.indexOf(row)];
     const usedPhotos = (src?.photos ?? []).map((id) => files.get(id)).filter((f): f is NonNullable<typeof f> => !!f && f.status === "ready" && !!f.url);
+    // Air-filled foils (no bundle) are their own type, so the store doesn't offer them inflated.
+    const air = !!(src?.foil && src.air && !src.helium);
     const r = await createProduct(c.env, ctx, {
       title: row.title,
       barcode,
@@ -373,7 +380,7 @@ app.post("/api/create", async (c) => {
       price: src?.price ?? undefined,
       stock: updateStock && src?.qty && src.qty > 0 ? { quantity: src.qty, locationId: stockLocationId } : undefined,
       // A foil balloon can be posted, and goes on every channel once it has a price (POS only while at $0).
-      ...(src?.foil ? { productType: BALLOON_TYPE, requiresShipping: true, online: !!src.price } : {}),
+      ...(src?.foil ? { productType: air ? AIR_TYPE : BALLOON_TYPE, requiresShipping: true, online: !!src.price, weightKg: FOIL_WEIGHT_KG } : {}),
     });
     let bundle: { status: "created"; productId: string } | { status: "skipped"; reason: string } | { status: "failed"; error: string } | undefined;
     let bundleRow: { bundleId: string; bundleVariantId: string; tierVariantId: string } | null = null;
@@ -400,8 +407,11 @@ app.post("/api/create", async (c) => {
           status: src.price ? "ACTIVE" : "DRAFT",
           online: true,
           productType: BUNDLE_TYPE,
-          requiresShipping: true,
+          // Collected in store only: an inflated balloon can't be posted.
+          requiresShipping: false,
           bundle: true,
+          // The storefront's "Helium Inflated Numbers" collection and age finder group number balloons by this tag.
+          extraTags: numberDigit(row.title) != null ? [NUMBER_TAG] : [],
         });
         if (!b.ok || !b.variantId) bundle = { status: "failed", error: b.ok ? "Shopify didn't return the bundle's variant." : b.error };
         else {

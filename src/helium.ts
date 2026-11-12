@@ -1,8 +1,11 @@
 /**
  * Helium bundles for foil balloons this tool adds, built the way the store's existing ones were:
  * a separate product "Helium INFLATED <name> Foil Balloon" (type Helium Inflated Balloons, every channel) made of
- * 1 × the flat balloon + 1 × the matching size of the Helium Inflation product. Shopify takes the bundle's stock
- * from the balloon; its price is fixed, so this file keeps it at balloon + inflation.
+ * 1 × the flat balloon + 1 × the matching size of the Helium Inflation product. Supplier pack wording in a title
+ * ("Pack of 5") is how the wholesaler sells them, not what one product holds, so it never changes the fill.
+ * Shopify takes the bundle's stock from the balloon; its price is fixed, so this file keeps it at balloon +
+ * inflation. A bundle is never posted (helium balloons are collected in store), so it is
+ * not a shippable item; Update helium bundles also corrects any bundle in the store that is.
  *
  * A balloon added at $0 gets its bundle as a DRAFT at $0, and the balloon stays on Point of Sale only, so nothing
  * can be bought online for the helium price alone. Once the balloon has a price (on the Prices page here, or at
@@ -16,6 +19,8 @@ import type { Env } from "./types";
 
 export const BUNDLE_TYPE = "Helium Inflated Balloons";
 export const BALLOON_TYPE = "Foil Balloons";
+/** Foil balloons filled with air (staff unticked the bundle, or under 40cm): never offered inflated. */
+export const AIR_TYPE = "Air Foil Balloon";
 
 export interface InflationTier {
   variantId: string;
@@ -111,8 +116,8 @@ export async function titlesInStore(env: Env, titles: string[]): Promise<Set<str
   return out;
 }
 
-/** Make a bundle variant out of the balloon variant and an inflation variant. */
-export async function linkBundle(env: Env, bundleVariantId: string, balloonVariantId: string, tierVariantId: string): Promise<string | null> {
+/** Make a bundle variant out of the balloon variant and an inflation variant (`fills` of it; 1 unless a caller says). */
+export async function linkBundle(env: Env, bundleVariantId: string, balloonVariantId: string, tierVariantId: string, fills = 1): Promise<string | null> {
   type R = { productVariantRelationshipBulkUpdate: { userErrors: { message: string }[] } };
   try {
     const res = await gql<R>(
@@ -126,7 +131,7 @@ export async function linkBundle(env: Env, bundleVariantId: string, balloonVaria
             parentProductVariantId: bundleVariantId,
             productVariantRelationshipsToCreate: [
               { id: balloonVariantId, quantity: 1 },
-              { id: tierVariantId, quantity: 1 },
+              { id: tierVariantId, quantity: Math.max(1, Math.floor(fills)) },
             ],
           },
         ],
@@ -167,7 +172,12 @@ export async function syncBalloons(env: Env, ctx: ShopContext, store: RunStore, 
   if (!rows.length) return out;
   const ids = [...new Set(rows.flatMap((r) => [r.productId, ...(r.bundleId ? [r.bundleId] : []), ...(r.tierVariantId ? [r.tierVariantId] : [])]))];
   type N =
-    | { __typename: "Product"; id: string; status: string; variants: { nodes: { id: string; price: string }[] } }
+    | {
+        __typename: "Product";
+        id: string;
+        status: string;
+        variants: { nodes: { id: string; price: string; productVariantComponents?: { nodes: { quantity: number; productVariant: { id: string } | null }[] } }[] };
+      }
     | { __typename: "ProductVariant"; id: string; price: string }
     | null;
   const data = await gql<{ nodes: N[] }>(
@@ -175,7 +185,7 @@ export async function syncBalloons(env: Env, ctx: ShopContext, store: RunStore, 
     `query Balloons($ids: [ID!]!) {
        nodes(ids: $ids) {
          __typename
-         ... on Product { id status variants(first: 2) { nodes { id price } } }
+         ... on Product { id status variants(first: 2) { nodes { id price productVariantComponents(first: 5) { nodes { quantity productVariant { id } } } } } }
          ... on ProductVariant { id price }
        }
      }`,
@@ -216,7 +226,9 @@ export async function syncBalloons(env: Env, ctx: ShopContext, store: RunStore, 
         out.errors.push("A helium size used by a bundle was removed from the Helium Inflation product.");
         continue;
       }
-      const want = bundlePrice(price, tier.price);
+      // How many times the bundle is filled (1 for bundles this tool makes), read from the bundle itself.
+      const fills = bundle.variants.nodes[0]?.productVariantComponents?.nodes.find((c) => c.productVariant?.id === r.tierVariantId)?.quantity ?? 1;
+      const want = bundlePrice(price, tier.price, fills);
       const have = Number(bundle.variants.nodes[0]?.price ?? 0).toFixed(2);
       if (have !== want) {
         calls.push(
@@ -260,6 +272,8 @@ export interface RepriceResult {
   waiting: number;
   /** Not set up as a bundle (no parts), so there's nothing to add up. */
   noParts: number;
+  /** Bundles that were set up as posted items, now set to collect in store only. */
+  unshippable: number;
   errors: string[];
   next: string | null;
 }
@@ -267,27 +281,39 @@ export interface RepriceResult {
 /**
  * Every helium bundle in the store, whoever made it (this tool, or the one-off script before it): set its price to
  * the sum of its parts (balloon + inflation, times their quantities). 50 bundles per call; send `after` (a Shopify
- * cursor) until `next` is null. Status, title and everything else stay as they are.
+ * cursor) until `next` is null. A bundle set up as a posted item is set to collect in store only. Status, title
+ * and everything else stay as they are.
  */
 export async function repriceStoreBundles(env: Env, after = ""): Promise<RepriceResult> {
-  type V = { id: string; price: string; productVariantComponents?: { nodes: { quantity: number; productVariant: { price: string } | null }[] } };
-  type R = { products: { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: { id: string; variants: { nodes: V[] } }[] } };
+  type Part = { quantity: number; productVariant: { id?: string; price: string; product?: { title: string; productType?: string | null } | null } | null };
+  type V = {
+    id: string;
+    price: string;
+    inventoryItem?: { requiresShipping: boolean } | null;
+    productVariantComponents?: { nodes: Part[] };
+  };
+  type R = { products: { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: { id: string; title?: string; variants: { nodes: V[] } }[] } };
   const data = await gql<R>(
     env,
     `query Bundles($q: String!, $after: String) {
        products(first: 50, after: $after, query: $q) {
          pageInfo { hasNextPage endCursor }
-         nodes { id variants(first: 5) { nodes { id price productVariantComponents(first: 10) { nodes { quantity productVariant { price } } } } } }
+         nodes { id title variants(first: 5) { nodes { id price inventoryItem { requiresShipping } productVariantComponents(first: 10) { nodes { quantity productVariant { id price product { title productType } } } } } } }
        }
      }`,
     { q: `product_type:"${BUNDLE_TYPE}"`, after: after || null },
   );
-  const out: RepriceResult = { checked: 0, repriced: 0, waiting: 0, noParts: 0, errors: [], next: data.products.pageInfo.hasNextPage ? data.products.pageInfo.endCursor : null };
+  const out: RepriceResult = { checked: 0, repriced: 0, waiting: 0, noParts: 0, unshippable: 0, errors: [], next: data.products.pageInfo.hasNextPage ? data.products.pageInfo.endCursor : null };
   const calls: string[] = [];
+  const shipping: string[] = [];
   for (const p of data.products.nodes) {
     for (const v of p.variants.nodes) {
       const parts = v.productVariantComponents?.nodes ?? [];
       out.checked++;
+      // Helium balloons are collected from the shop: a bundle set up as a posted item could be sent in an online order.
+      if (v.inventoryItem?.requiresShipping) {
+        shipping.push(`productVariantsBulkUpdate(productId: ${JSON.stringify(p.id)}, variants: [{id: ${JSON.stringify(v.id)}, inventoryItem: {requiresShipping: false}}]) { userErrors { field message } }`);
+      }
       if (!parts.length) {
         out.noParts++;
         continue;
@@ -308,6 +334,17 @@ export async function repriceStoreBundles(env: Env, after = ""): Promise<Reprice
       for (const e of errs) {
         if (e.length) out.errors.push(e.map((x) => x.message).join("; "));
         else out.repriced++;
+      }
+    } catch (e) {
+      out.errors.push(e instanceof Error ? e.message : String(e));
+    }
+  }
+  for (let i = 0; i < shipping.length; i += 10) {
+    try {
+      const errs = await manyMutations(env, shipping.slice(i, i + 10));
+      for (const e of errs) {
+        if (e.length) out.errors.push(e.map((x) => x.message).join("; "));
+        else out.unshippable++;
       }
     } catch (e) {
       out.errors.push(e instanceof Error ? e.message : String(e));

@@ -263,6 +263,10 @@ export interface NewProduct {
   status?: "ACTIVE" | "DRAFT";
   /** A bundle parent: its variant can only be sold with its components (added after it's made). */
   bundle?: boolean;
+  /** Shipping weight in kg (for products that can be posted). */
+  weightKg?: number;
+  /** Tags added on top of the import tags (sent even when "Tag new products" is off). */
+  extraTags?: string[];
 }
 
 export type CreateResult =
@@ -305,6 +309,10 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
     variant.inventoryItem = { tracked: true, requiresShipping: !!p.requiresShipping };
     variant.inventoryQuantities = [{ locationId: p.stock.locationId, name: "available", quantity: Math.floor(p.stock.quantity) }];
   }
+  // A posted item needs a weight, or checkout quotes the lightest postage and Google flags it.
+  if (p.requiresShipping && p.weightKg && p.weightKg > 0) {
+    (variant.inventoryItem as Record<string, unknown>).measurement = { weight: { value: Number(p.weightKg.toFixed(3)), unit: "KILOGRAMS" } };
+  }
   if (p.barcode) variant.barcode = p.barcode;
   if (p.sku) variant.sku = p.sku;
 
@@ -329,6 +337,7 @@ export async function createProduct(env: Env, ctx: ShopContext, p: NewProduct): 
       input.metafields = [{ namespace: f.namespace, key: f.key, type: f.type, value: importSourceValue(f.type, p.importId) }];
       if (p.tags ?? env.IMPORT_TAGS !== "false") input.tags = [importTag(p.importId), ...(p.runCode ? [`run-${p.runCode}`] : [])];
     }
+    if (p.extraTags?.length) input.tags = [...new Set([...((input.tags as string[] | undefined) ?? []), ...p.extraTags])];
     let data = await gql<R>(env, mutation, { input });
     let photoError: string | undefined;
     const filesError = () => data.productSet.userErrors.some((e) => (e.field ?? []).includes("files"));

@@ -626,7 +626,7 @@ export function createPricing(ctx) {
     if (btn.disabled) return;
     btn.disabled = true;
     const t = { checked: 0, online: 0, repriced: 0, waiting: 0, gone: 0, errors: [] };
-    const b = { checked: 0, repriced: 0, waiting: 0, noParts: 0 };
+    const b = { checked: 0, repriced: 0, waiting: 0, noParts: 0, unshippable: 0 };
     try {
       let after = 0;
       for (let guard = 0; guard < 200; guard++) {
@@ -641,7 +641,7 @@ export function createPricing(ctx) {
       for (let guard = 0; guard < 400; guard++) {
         note.textContent = `Checking every helium bundle in the store… ${fmt(b.checked)} so far, ${fmt(b.repriced)} repriced.`;
         const r = await api.repriceBundles(cursor);
-        for (const k of ["checked", "repriced", "waiting", "noParts"]) b[k] += r[k] ?? 0;
+        for (const k of ["checked", "repriced", "waiting", "noParts", "unshippable"]) b[k] += r[k] ?? 0;
         t.errors.push(...(r.errors ?? []));
         if (!r.next) break;
         cursor = r.next;
@@ -649,6 +649,7 @@ export function createPricing(ctx) {
       const parts = [
         `${fmt(b.checked)} helium bundles checked, ${fmt(b.repriced + t.repriced)} repriced to balloon + inflation`,
         t.online ? `${fmt(t.online)} foil balloons put online` : "",
+        b.unshippable ? `${fmt(b.unshippable)} set to collect in store only (they were set up to be posted)` : "",
         b.waiting ? `${fmt(b.waiting)} left alone because their balloon is still at $0.00` : "",
         b.noParts ? `${fmt(b.noParts)} aren't set up as bundles (no parts), so they keep their price` : "",
       ].filter(Boolean);
